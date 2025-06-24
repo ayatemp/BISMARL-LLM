@@ -1,222 +1,179 @@
-# coding=utf-8
-# Copyright 2023 The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-import sys
-
-sys.path.append('/home/trl/trl')
-
-import os
-import subprocess
-
-
-def select_least_used_gpu():
-    smi_output = subprocess.check_output(
-        ['nvidia-smi', '--query-gpu=memory.used', '--format=csv,noheader,nounits']).decode('utf-8')
-    gpu_memory = [int(x) for x in smi_output.strip().split('\n')]
-    least_used_gpu = gpu_memory.index(min(gpu_memory))
-    return least_used_gpu
-
-
-# least_used_gpu = select_least_used_gpu()
-least_used_gpu = 7
-os.environ['CUDA_VISIBLE_DEVICES'] = str(least_used_gpu)
-
-print(">> Chosen GPU: {}".format(os.environ['CUDA_VISIBLE_DEVICES']))
-
-import time
+import os, sys, subprocess, time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
-import torch
-import tyro
-import wandb
-from accelerate import Accelerator
-from datasets import load_dataset
-from peft import LoraConfig
+import torch, tyro, wandb
 from tqdm import tqdm
-from transformers import AutoTokenizer, pipeline
-
-from trl import AutoModelForCausalLMWithValueHead, AutoModelForSeq2SeqLMWithValueHead, PPOConfig, PPOTrainer, set_seed
+from accelerate.utils import is_npu_available, is_xpu_available
+from datasets import load_dataset, load_from_disk, DatasetDict
+from transformers import AutoTokenizer, pipeline, set_seed
+from trl import (
+    AutoModelForCausalLMWithValueHead,
+    AutoModelForSeq2SeqLMWithValueHead,
+    PPOConfig,
+    PPOTrainer,
+)
 from trl.core import LengthSampler
-from trl.import_utils import is_npu_available, is_xpu_available
+from peft import LoraConfig
 
-tqdm.pandas()
+###############################################################################
+# GPU 選択 (一番空いているもの / fallback=0) ---------------------------------
+###############################################################################
 
+def _pick_gpu() -> str:
+    try:
+        out = subprocess.check_output([
+            "nvidia-smi",
+            "--query-gpu=memory.used",
+            "--format=csv,noheader,nounits",
+        ]).decode()
+        mem = [int(x) for x in out.strip().split("\n")]
+        return str(mem.index(min(mem)))
+    except Exception:
+        return "0"
+
+os.environ["CUDA_VISIBLE_DEVICES"] = _pick_gpu()
+print(f"[INFO] CUDA_VISIBLE_DEVICES set to {os.environ['CUDA_VISIBLE_DEVICES']}")
+
+###############################################################################
+# 引数定義 --------------------------------------------------------------------
+###############################################################################
 
 @dataclass
 class ScriptArguments:
     ppo_config: PPOConfig = field(
         default_factory=lambda: PPOConfig(
-            tracker_kwargs={"wandb": {"entity": "Population-LLM",
-                                      "name": f"single-rl-gpt2-medium-{time.strftime('%m%d%H%M', time.localtime())}"}},
-            tracker_project_name="imdb",
-            model_name="/home/trl/trl/hf_hub/models/gpt2-medium",
-            query_dataset="/home/trl/trl/hf_hub/datasets/imdb",
-            reward_model="sentiment-analysis:/home/trl/trl/hf_hub/models/lvwerra-distilbert-imdb",
+            tracker_kwargs={
+                "wandb": {
+                    "entity": "ayato-kaku-",
+                    "name": f"single-rl-gpt2-medium-{time.strftime('%m%d%H%M')}",
+                }
+            },
+            tracker_project_name="imdb_ppo",
+            model_name="D:/LLMModel/gpt2-medium",
+            query_dataset="D:/LLMModel/imdb_dataset",
+            reward_model="sentiment-analysis:D:/LLMModel/distilbert-imdb",
             learning_rate=1.41e-5,
             log_with="wandb",
-            mini_batch_size=256,
             batch_size=256,
+            mini_batch_size=256,
             gradient_accumulation_steps=1,
             early_stopping=False,
-            # target_kl=6.0,
             kl_penalty="full",
             seed=123,
-            use_score_scaling=False,
-            use_score_norm=False,
-            score_clip=None,
             init_kl_coef=0.3,
-            # adap_kl_ctrl=False
         )
     )
     use_seq2seq: bool = False
-    """whether to use seq2seq models"""
     use_peft: bool = False
-    """whether to use peft"""
     peft_config: Optional[LoraConfig] = field(
-        default_factory=lambda: LoraConfig(
-            r=16,
-            lora_alpha=16,
-            bias="none",
-            task_type="CAUSAL_LM",
-        ),
+        default_factory=lambda: LoraConfig(r=16, lora_alpha=16, bias="none", task_type="CAUSAL_LM")
     )
-    trust_remote_code: bool = field(default=False, metadata={"help": "Enable `trust_remote_code`"}),
-    group: Optional[str] = field(default="imdb-single", metadata={"help": "Wandb grouping"})
-
+    trust_remote_code: bool = False
+    group: Optional[str] = "imdb-single"
 
 args = tyro.cli(ScriptArguments)
 set_seed(args.ppo_config.seed)
 
+###############################################################################
+# tokenizer -------------------------------------------------------------------
+###############################################################################
 
-# We then define the arguments to pass to the sentiment analysis pipeline.
-# We set `return_all_scores` to True to get the sentiment score for each token.
-sent_kwargs = {"return_all_scores": True, "function_to_apply": "none", "batch_size": 16}
+tokenizer = AutoTokenizer.from_pretrained(args.ppo_config.model_name, trust_remote_code=args.trust_remote_code)
+if tokenizer.pad_token_id is None:
+    tokenizer.pad_token_id = tokenizer.eos_token_id
+# decoder-only は必ず left-pad
+tokenizer.padding_side = "left"
+print(f"[INFO] tokenizer padding_side = {tokenizer.padding_side}")
 
-trl_model_class = AutoModelForCausalLMWithValueHead if not args.use_seq2seq else AutoModelForSeq2SeqLMWithValueHead
+###############################################################################
+# データセット ----------------------------------------------------------------
+###############################################################################
 
+def build_dataset(cfg: PPOConfig, path: str, min_len=2, max_len=8):
+    if os.path.isdir(path):
+        ds = load_from_disk(path)
+        if isinstance(ds, DatasetDict):
+            ds = ds["train"]
+    else:
+        ds = load_dataset(path, split="train")
 
-# Below is an example function to build the dataset. In our case, we use the IMDB dataset
-# from the `datasets` library. One should customize this function to train the model on
-# its own dataset.
-def build_dataset(config, query_dataset, input_min_text_length=2, input_max_text_length=8):
-    """
-    Build dataset for training. This builds the dataset from `load_dataset`, one should
-    customize this function to train the model on its own dataset.
-
-    Args:
-        query_dataset (`str`):
-            The name of the dataset to be loaded.
-
-    Returns:
-        dataloader (`torch.utils.data.DataLoader`):
-            The dataloader for the dataset.
-    """
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    tokenizer.pad_token = tokenizer.eos_token
-    # load imdb with datasets
-    ds = load_dataset(query_dataset, split="train")
     ds = ds.rename_columns({"text": "review"})
-    ds = ds.filter(lambda x: len(x["review"]) > 200, batched=False)
+    ds = ds.filter(lambda x: len(x["review"]) > 200)
 
-    input_size = LengthSampler(input_min_text_length, input_max_text_length)
+    sampler = LengthSampler(min_len, max_len)
 
-    def tokenize(sample):
-        sample["input_ids"] = tokenizer.encode(sample["review"])[: input_size()]
-        sample["query"] = tokenizer.decode(sample["input_ids"])
-        return sample
+    def _tok(example):
+        ids = tokenizer.encode(example["review"])[: sampler()]
+        example["input_ids"] = ids
+        example["query"] = tokenizer.decode(ids)
+        return example
 
-    ds = ds.map(tokenize, batched=False)
-    ds.set_format(type="torch")
+    # Windows は spawn → num_proc=1
+    ds = ds.map(_tok, batched=False)
+    ds.set_format(type="torch", columns=["input_ids", "query"])
     return ds
 
-
-# We retrieve the dataloader by calling the `build_dataset` function.
+print("[INFO] Loading dataset …")
 dataset = build_dataset(args.ppo_config, args.ppo_config.query_dataset)
+print(f"[INFO] dataset size = {len(dataset)}")
+if len(dataset) == 0:
+    raise RuntimeError("Dataset is empty — adjust filter condition.")
+
+###############################################################################
+# collator (left padding) ------------------------------------------------------
+###############################################################################
+
+def left_pad(ids: torch.Tensor, pad_id: int, length: int) -> torch.Tensor:
+    diff = length - ids.size(0)
+    if diff <= 0:
+        return ids
+    return torch.nn.functional.pad(ids, (diff, 0), value=pad_id)
 
 
-def collator(data):
-    return dict((key, [d[key] for d in data]) for key in data[0])
+def make_collator(tok):
+    pad_id = tok.pad_token_id
 
+    def _collate(batch):
+        seqs = [b["input_ids"] for b in batch]
+        max_len = max(len(s) for s in seqs)
+        ids = torch.stack([left_pad(s, pad_id, max_len) for s in seqs])
+        attn = (ids != pad_id).long()
+        return {"input_ids": ids, "attention_mask": attn, "query": [b["query"] for b in batch]}
 
-# Now let's build the model, the reference model, and the tokenizer.
-if not args.use_peft:
-    ref_model = trl_model_class.from_pretrained(args.ppo_config.model_name, trust_remote_code=args.trust_remote_code)
-    device_map = None
-    peft_config = None
-else:
-    peft_config = args.peft_config
-    ref_model = None
-    # Copy the model to each device
-    device_map = {"": Accelerator().local_process_index}
+    return _collate
 
-model = trl_model_class.from_pretrained(
-    args.ppo_config.model_name,
-    trust_remote_code=args.trust_remote_code,
-    device_map=device_map,
-    peft_config=peft_config,
+collator = make_collator(tokenizer)
+
+###############################################################################
+# モデル & PPOTrainer ---------------------------------------------------------
+###############################################################################
+
+Model = AutoModelForCausalLMWithValueHead if not args.use_seq2seq else AutoModelForSeq2SeqLMWithValueHead
+model = Model.from_pretrained(args.ppo_config.model_name, trust_remote_code=args.trust_remote_code)
+
+ppo_trainer = PPOTrainer(
+    args.ppo_config, model, None, tokenizer, dataset=dataset, data_collator=collator
 )
+ppo_trainer.tokenizer.padding_side = "left"
 
-tokenizer = AutoTokenizer.from_pretrained(args.ppo_config.model_name)
+###############################################################################
+# reward pipeline -------------------------------------------------------------
+###############################################################################
 
-# Some tokenizers like GPT-2's don't have a padding token by default, so we set one here.
-tokenizer.pad_token_id = tokenizer.eos_token_id
-
-# We then build the PPOTrainer, passing the model, the reference model, the tokenizer
-ppo_trainer = PPOTrainer(args.ppo_config, model, ref_model, tokenizer, dataset=dataset, data_collator=collator)
-
-# We then build the sentiment analysis pipeline, passing the model name and the
-# sentiment analysis pipeline arguments. Let's also make sure to set the device
-# to the same device as the PPOTrainer.
-device = ppo_trainer.accelerator.device
-if ppo_trainer.accelerator.num_processes == 1:
-    if is_xpu_available():
-        device = "xpu:0"
-    elif is_npu_available():
-        device = "npu:0"
-    else:
-        device = 0 if torch.cuda.is_available() else "cpu"  # to avoid a `pipeline` bug
-ds_plugin = ppo_trainer.accelerator.state.deepspeed_plugin
-task, model_name = args.ppo_config.reward_model.split(":")
-if ds_plugin is not None and ds_plugin.is_zero3_init_enabled():
-    with ds_plugin.zero3_init_context_manager(enable=False):
-        sentiment_pipe = pipeline(task, model=model_name, device=device)
-else:
-    sentiment_pipe = pipeline(task, model=model_name, device=device)
-
-# Some tokenizers like GPT-2's don't have a padding token by default, so we set one here.
+task, reward_name = args.ppo_config.reward_model.split(":", 1)
+sentiment_pipe = pipeline(task, model=reward_name, device=ppo_trainer.accelerator.device,
+                          function_to_apply="none", batch_size=16)
 if sentiment_pipe.tokenizer.pad_token_id is None:
     sentiment_pipe.tokenizer.pad_token_id = tokenizer.pad_token_id
+sentiment_pipe.tokenizer.padding_side = "left"
 
-if sentiment_pipe.model.config.pad_token_id is None:
-    sentiment_pipe.model.config.pad_token_id = tokenizer.pad_token_id
+###############################################################################
+# PPO ループ ------------------------------------------------------------------
+###############################################################################
 
-# We then define the arguments to pass to the `generate` function. These arguments
-# are passed to the `generate` function of the PPOTrainer, which is a wrapper around
-# the `generate` function of the trained model.
-
-# backup all code on wandb
-arti_code = wandb.Artifact("code", type="code")
-arti_code.add_file("/home/trl/trl/imdb_train/ppo.py")
-arti_code.add_dir("/home/trl/trl/eval", name="eval")
-arti_code.add_dir("/home/trl/trl/utils", name="utils")
-wandb.log_artifact(arti_code)
-
-output_min_length = 4
-output_max_length = 16
-output_length_sampler = LengthSampler(output_min_length, output_max_length)
-
+sampler = LengthSampler(4, 16)
 generation_kwargs = {
     "min_length": -1,
     "top_k": 0.0,
@@ -226,43 +183,31 @@ generation_kwargs = {
     "repetition_penalty": 1.1,
 }
 
-for epoch, batch in tqdm(enumerate(ppo_trainer.dataloader)):
-    query_tensors = batch["input_ids"]
+device_t = ppo_trainer.accelerator.device
 
-    gen_len = output_length_sampler()
-    generation_kwargs["max_new_tokens"] = gen_len
-    # Get response from gpt2
-    response_tensors, ref_response_tensors = ppo_trainer.generate(
-        query_tensors, return_prompt=False, generate_ref_response=True, **generation_kwargs
-    )
+for step, batch in tqdm(enumerate(ppo_trainer.dataloader, 1), total=len(ppo_trainer.dataloader)):
+    query_tensors = [ids for ids in batch["input_ids"]]
 
-    # batch["response"] = [tokenizer.decode(r.squeeze()[-gen_len:]) for r in response_tensors]
-    # batch["ref_response"] = [tokenizer.decode(r.squeeze()[-gen_len:]) for r in ref_response_tensors]
-    batch["response"] = tokenizer.batch_decode(response_tensors)
-    batch["ref_response"] = tokenizer.batch_decode(ref_response_tensors)
+    generation_kwargs["max_new_tokens"] = sampler()
+    out, out_ref = ppo_trainer.generate(query_tensors, return_prompt=False, generate_ref_response=True, **generation_kwargs)
 
-    # Compute sentiment score
+    batch["response"] = tokenizer.batch_decode(out)
+    batch["ref_response"] = tokenizer.batch_decode(out_ref)
+
     texts = [q + r for q, r in zip(batch["query"], batch["response"])]
-    pipe_outputs = sentiment_pipe(texts, **sent_kwargs)
-    rewards = [torch.tensor(output[1]["score"]) for output in pipe_outputs]
+    rewards = [torch.tensor(res["score"], device=device_t) for res in sentiment_pipe(texts)]
+
     ref_texts = [q + r for q, r in zip(batch["query"], batch["ref_response"])]
-    ref_pipe_outputs = sentiment_pipe(ref_texts, **sent_kwargs)
-    ref_rewards = [torch.tensor(output[1]["score"]) for output in ref_pipe_outputs]
+    ref_rewards = [torch.tensor(res["score"], device=device_t) for res in sentiment_pipe(ref_texts)]
     batch["ref_rewards"] = ref_rewards
 
-    # Run PPO step
-    stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
-    try:
-        stats.pop("temp/average_new_tokens")
-    except:
-        pass
+    stats = ppo_trainer.step(query_tensors, out, rewards)
+    ppo_trainer.log_stats(stats, batch, rewards, columns_to_log=["query", "response"])
 
-    ppo_trainer.log_stats(stats,
-                          batch,
-                          rewards,
-                          columns_to_log=["query", "response", "ref_response", "ref_rewards"],
-                          reward_pioneer=rewards,
-                          reward_observer=rewards)
 
-    if epoch > 100:
-        break
+
+save_dir = Path("checkpoints/gpt2_ppo_final")
+save_dir.mkdir(parents=True, exist_ok=True)
+model.save_pretrained(save_dir)
+tokenizer.save_pretrained(save_dir)
+print(f"[INFO] model saved to {save_dir.resolve()}")

@@ -97,7 +97,7 @@ class ScriptArguments:
     repetition_penalty: float = 1.05
 
     # training length
-    total_steps: int = 1200
+    total_steps: int = 3000
     swap_every: int = 5
 
     group: Optional[str] = "imdb-dual-role-ppo-lora-stable"

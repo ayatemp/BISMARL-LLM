@@ -11,6 +11,7 @@ venv/
 *.tmp
 *.json
 *.wandb
+*.parquet
 wandb/
 
 # Jupyter Notebook チェックポイント

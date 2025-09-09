@@ -68,7 +68,8 @@ def moving_avg(xs, k=20):
     return out
 
 '''
-データ型の設定
+データ型の設定。学習に必要なパラメータをすべてここで定義している
+
 '''
 @dataclass
 class ScriptArguments:
@@ -121,7 +122,10 @@ class ScriptArguments:
     group: Optional[str] = "imdb-dual-role-ppo-lora-stable"
     run_name: Optional[str] = f"dual-role-stable-{int(time.time())}"
 
-
+'''
+# メイン処理開始
+ここではコマンドラインでパラメータが指定できるようにargsで受け取っている
+'''
 args = tyro.cli(ScriptArguments)
 set_seed(args.ppo_config.seed)
 
@@ -129,6 +133,10 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 print(">> Using GPU:", os.environ["CUDA_VISIBLE_DEVICES"])
 
 
+'''
+データセットの構築
+指定したデータセットからいろいろdatasetを実際に定義していく
+'''
 def build_dataset(model_name: str, query_dataset: str, min_len: int = 40, max_prompt_tokens: int = 30):
     tok = AutoTokenizer.from_pretrained(model_name)
     tok.pad_token = tok.eos_token
@@ -136,6 +144,7 @@ def build_dataset(model_name: str, query_dataset: str, min_len: int = 40, max_pr
     ds = ds.rename_columns({"text": "review"})
     ds = ds.filter(lambda x: len(x["review"]) > min_len)
 
+    # 学習用の入力携帯にするためにトークン化している
     def to_query(sample):
         ids = tok.encode(sample["review"])[: max_prompt_tokens]
         sample["input_ids"] = ids
@@ -148,13 +157,20 @@ def build_dataset(model_name: str, query_dataset: str, min_len: int = 40, max_pr
 
 dataset = build_dataset(args.model_name, args.query_dataset)
 
-
+'''
+データセットをバッチ化するための関数
+位置バッチごとにinput_idsとqueryをまとめて返すような辞書型を定義する 
+'''
 def collate(features):
     input_ids = [torch.tensor(f["input_ids"], dtype=torch.long) for f in features]
     queries = [f["query"] for f in features]
     return {"input_ids": input_ids, "query": queries}
 
 
+'''
+モデルとトークナイザの準備
+PPOTrainerの準備
+'''
 model = AutoModelForCausalLMWithValueHead.from_pretrained(
     args.model_name,
     peft_config=args.peft_config,
@@ -174,6 +190,11 @@ ppo_trainer = PPOTrainer(
 device = ppo_trainer.accelerator.device
 
 task, reward_model_name = args.reward_model.split(":")
+
+'''
+# 感情分析パイプラインの準備
+これを使うことで、モデルのロード、トークナイズ、推論を一気にやってくれる
+'''
 sentiment = pipeline(
     task,
     model=reward_model_name,
@@ -187,6 +208,10 @@ if sentiment.tokenizer.pad_token_id is None:
 if sentiment.model.config.pad_token_id is None:
     sentiment.model.config.pad_token_id = tokenizer.pad_token_id
 
+'''
+生成パラメータの生成と学習ログの設定
+ただすでにdatasetとしていろいろ定義していたのであとはそれを引用するだけでいい
+'''
 gen_kwargs_base = dict(
     do_sample=True,
     top_k=args.top_k,
@@ -198,6 +223,9 @@ gen_kwargs_base = dict(
     pad_token_id=tokenizer.eos_token_id,
 )
 
+'''
+２つめのagentが生成するときに指定される追加のプロンプトテンプレート
+'''
 merge_template = 'Please rewrite this to sound more positive while keeping meaning: "{}"'
 len_sampler = LengthSampler(8, 16)
 
@@ -216,6 +244,23 @@ reward_hist: List[float] = []
 # for final printout
 last_obs_text: List[str] = []
 last_pio_text: List[str] = []
+
+
+'''
+# メインの学習ループ
+ざっくりの流れ
+１．データローダからバッチ取得
+２．Aが生成ハイパラを少しランダムに上書き
+３．Aが文章を生成
+４．BがAの生成を受け取ってさらに文章を生成
+５．感情分析パイプラインでそれぞれの生成文に対してスコアを計算
+６．role_flagに応じて更新順を交代しながらppotrainを二回実行
+
+
+
+こんな感じ
+'''
+
 
 for step, batch in tqdm(enumerate(ppo_trainer.dataloader), total=args.total_steps, desc="Dual-Role PPO (LoRA)"):
     if step >= args.total_steps:

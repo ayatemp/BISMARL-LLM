@@ -14,6 +14,10 @@ venv/
 *.parquet
 wandb/
 
+# モデルのログはできるようにする
+!IRM/irm_iclr_model/
+!IRM/irm_iclr_model/*.json
+
 # Jupyter Notebook チェックポイント
 .ipynb_checkpoints/
 

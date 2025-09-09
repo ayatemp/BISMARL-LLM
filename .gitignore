@@ -9,6 +9,9 @@ venv/
 # ログ・一時ファイル
 *.log
 *.tmp
+*.json
+*.wandb
+wandb/
 
 # Jupyter Notebook チェックポイント
 .ipynb_checkpoints/

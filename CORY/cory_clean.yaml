@@ -1,0 +1,27 @@
+name: CORY_clean
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy=1.26.4
+  - scipy=1.13.*
+  - scikit-learn=1.4.*
+  # 以下は元のCORYから残す（略）
+  - pytorch=2.2.2=py3.10_cuda11.8_cudnn8.7.0_0
+  - pytorch-cuda=11.8
+  - torchvision=0.17.2=py310_cu118
+  - cudatoolkit=11.8  # 追加しておくと安全
+  - pandas
+  - pip
+  - pip:
+      - accelerate==0.31.0
+      - datasets==2.20.0
+      - deepspeed==0.14.4
+      - transformers==4.43.3
+      - trl==0.9.6
+      - peft==0.12.0
+      - wandb==0.21.1
+      # numpy / scipy / torch は削除

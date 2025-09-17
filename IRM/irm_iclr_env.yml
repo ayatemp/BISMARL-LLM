@@ -1,0 +1,24 @@
+# irm_iclr_env.yml (GPU, CUDA 12.x)
+name: irm_iclr
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1     # ドライバが対応していれば 12.4 等でも可
+  - transformers
+  - datasets
+  - pandas
+  - pyarrow
+  - numpy
+  - matplotlib
+  - scipy
+  - scikit-learn
+  - pip
+  - pip:
+      - accelerate

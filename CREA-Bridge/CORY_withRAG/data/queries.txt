@@ -1,0 +1,11 @@
+multimodal grounding for household robots
+neural theorem proving
+protein structure design with diffusion
+class-agnostic tracking in occlusion
+energy-efficient LLM training on edge devices
+human-AI co-writing systems
+legal reasoning with retrieval-augmented LLMs
+generative materials design
+climate downscaling with transformers
+graph-based social influence modeling
+EOF

@@ -1,0 +1,38 @@
+---
+device: "cuda:0"
+model_directory: "../../model_store/"
+seed: 42
+
+data:
+  batch_size: 128
+  max_n_sentences_per_example: 200
+  num_workers: 2
+  output_directory: "../../data/section_classification/"
+
+trainer:
+  model_type: transformer
+  lr: 0.0001
+
+  model:
+    dropout: 0.3
+    num_classes: 5
+    num_layers: 2
+
+  load:
+    load: False
+    experiment_name: ""
+    run_id: ""
+    checkpoint: ""
+
+training:
+  distributed: False
+  epochs: 20
+  accelerator: "gpu"
+  strategy: ""
+
+logging:
+  project: automatic_scientific_qm
+  name: "section_classifier"
+  mode: online
+  tags: []
+

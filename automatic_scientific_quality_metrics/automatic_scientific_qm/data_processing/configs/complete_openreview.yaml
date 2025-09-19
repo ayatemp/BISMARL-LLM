@@ -1,0 +1,8 @@
+---
+device: "cuda:0"
+dataset_name: "openreview-iclr" 
+save_directory: "../../data/processed"
+max_n_sentences_per_example: 200
+
+# GROBID config 
+max_workers: 4

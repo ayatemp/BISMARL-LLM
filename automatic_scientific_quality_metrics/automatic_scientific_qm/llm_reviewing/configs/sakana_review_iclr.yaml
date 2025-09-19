@@ -1,0 +1,11 @@
+---
+dataset: iclr
+venue_file: "./data/iclr_paperhashes.json"
+output_file: "./data/iclr_sakana_evaluation.json"
+llm_provider: "openai"
+openai_model: "gpt-4o-2024-08-06"
+anthropic_model: "claude-3-5-sonnet-20240620"
+num_reflections: 5 
+num_fs_examples: 1
+num_reviews_ensemble: 1
+temperature: 0.1

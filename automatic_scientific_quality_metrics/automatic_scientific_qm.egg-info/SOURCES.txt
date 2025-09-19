@@ -1,0 +1,9 @@
+LICENSE
+README.md
+pyproject.toml
+automatic_scientific_qm/__init__.py
+automatic_scientific_qm.egg-info/PKG-INFO
+automatic_scientific_qm.egg-info/SOURCES.txt
+automatic_scientific_qm.egg-info/dependency_links.txt
+automatic_scientific_qm.egg-info/requires.txt
+automatic_scientific_qm.egg-info/top_level.txt

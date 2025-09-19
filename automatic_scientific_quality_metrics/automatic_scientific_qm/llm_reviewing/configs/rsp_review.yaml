@@ -1,0 +1,12 @@
+---
+seed: 1
+device: "cuda:0"
+dataset: "iclr"
+paper_representation: "title_abstract"
+evaluation_algorithm: "direct_prediction"
+model_checkpoint: "./model_store/iclr_score_prediction.ckpt"
+logging:
+  project: automatic_scientific_qm
+  name: "rsp_evaluation_score_prediction"
+  mode: online
+  tags: []

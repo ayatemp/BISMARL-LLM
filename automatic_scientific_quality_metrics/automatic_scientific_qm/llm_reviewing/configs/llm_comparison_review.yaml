@@ -1,0 +1,6 @@
+---
+dataset: "iclr"
+llm_provider: anthropic 
+antrhopic_model: claude-3-5-sonnet-20240620 
+openai_model: gpt-4o-2024-11-20
+seed: 1

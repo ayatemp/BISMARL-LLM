@@ -1,0 +1,15 @@
+---
+seed: 1
+device: "cuda:0"
+dataset: "neurips"
+evaluation_algorithm: "swiss_tournament"
+paper_representation: "title_abstract"
+model_checkpoint: "./model_store/neurips_pairwise_comparison.ckpt"
+model_type: "rsp"
+llm_provider: ""
+logging:
+  project: automatic_scientific_qm
+  name: "rsp_evaluation_pairwise_comparison"
+  mode: online
+  tags: []
+

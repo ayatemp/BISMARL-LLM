@@ -1,0 +1,42 @@
+---
+device: "cuda:0"
+model_directory: "../../model_store/"
+seed: 42
+
+
+data:
+  dataset: "openreview-iclr"
+  pairwise_comparison: True
+  context_type: "no_context"
+  paper_representation: "title_abstract"
+  score_type: "mean_score"
+  batch_size: 128
+  max_n_sentences_per_example: 200
+  num_workers: 2
+  output_directory: "../../data/score_prediction"
+
+trainer:
+  lr: 0.00005
+  model:
+    n_topics: 0
+    large: False
+    dropout: 0.3
+    num_layers: 1
+    nheads: 1
+
+  load:
+    load: False
+    checkpoint: ""
+
+training:
+  distributed: True
+  accelerator: gpu
+  epochs: 100
+  gpus: [0]
+  strategy: ddp_find_unused_parameters_true
+
+wandb:
+  project: automatic_scientific_qm
+  name: "score_prediction"
+  mode: online
+  tags: []

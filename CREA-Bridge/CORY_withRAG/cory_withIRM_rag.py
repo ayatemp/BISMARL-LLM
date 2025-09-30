@@ -60,6 +60,61 @@ def try_parse_json(s: str) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
+def extract_json_block(text: str) -> str | None:
+    """最初に現れる最外カッコのJSONブロックを手動パースで抽出（正規表現に依存しない）"""
+    if not text:
+        return None
+    # 先頭の '{' を探す（途中にプロンプトが混ざっていてもOK）
+    start = text.find('{')
+    if start == -1:
+        return None
+
+    depth = 0
+    i = start
+    in_str = False
+    esc = False
+    while i < len(text):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    return text[start:i+1]
+        i += 1
+    return None  # 閉じカッコまで到達しなかった
+
+def try_parse_json_relaxed(text: str):
+    """プロンプト等が混ざった出力からJSON部分だけ抜いてパース。失敗時None"""
+    jtxt = extract_json_block(text)
+    if not jtxt:
+        return None
+    try:
+        return json.loads(jtxt)
+    except Exception:
+        return None
+
+def try_parse_json_relaxed(text: str):
+    """プロンプト混入やゴミ付き出力からJSONだけ抜いてパース（失敗ならNone）"""
+    jtxt = extract_json_block(text)
+    if not jtxt:
+        return None
+    try:
+        return json.loads(jtxt)
+    except Exception:
+        # ここで json_repair を使えるなら呼ぶ（導入していないならスキップ）
+        return None
+
 def validate_schema(obj: Dict[str, Any]) -> bool:
     if not isinstance(obj, dict):
         return False
@@ -76,6 +131,32 @@ def validate_schema(obj: Dict[str, Any]) -> bool:
         if set(map(str.lower, ic)) == set(map(str.lower, nc)):
             return False
     return True
+
+def _pretty_trunc(s: str, limit: int) -> str:
+    if s is None:
+        return ""
+    s = s.strip()
+    if len(s) <= limit:
+        return s
+    return s[:limit] + f"\n... [TRUNCATED {len(s)-limit} chars]"
+
+def _print_samples(title: str, pairs: list[tuple[str,str]], max_chars: int = 1200):
+    print(f"\n===== {title} =====")
+    for i, (pr, rs) in enumerate(pairs):
+        print(f"\n--- sample #{i} ---")
+        print("[PROMPT]\n" + _pretty_trunc(pr, max_chars))
+        print("\n[OUTPUT]\n" + _pretty_trunc(rs, max_chars))
+
+def _strip_echo(prompts, outputs):
+    cleaned = []
+    for p, o in zip(prompts, outputs):
+        if o.startswith(p):
+            cleaned.append(o[len(p):].lstrip())
+        else:
+            cleaned.append(o)
+    return cleaned
+
+
 
 def make_irm_text_from_idea(idea: Dict[str, Any]) -> str:
     t = idea.get("title", "").strip()
@@ -336,6 +417,11 @@ class TrainArgs:
     irm_offload_folder: str | None = None
     irm_max_memory: dict | None = None
 
+    print_every_steps: int = 100        # 何ステップごとに印字するか（0なら無効）
+    print_n_samples: int = 2            # 1回の印字で表示するサンプル数（バッチ先頭から）
+    print_prompt_max_chars: int = 1200  # 端末表示でのプロンプト/出力の最大文字数
+    print_ctx_docs: int = 3             # 印字時のObserver用RAG文脈の最大件数（見やすさ用）
+
 # -----------------------------------------------------------------------------
 # データ（RAGシード）
 # -----------------------------------------------------------------------------
@@ -387,6 +473,7 @@ def build_ctx_block(seed: Dict[str, Any], max_docs: int = 5) -> str:
         ctx_lines.append(f"- {title}\n  {abstract}")
     return RAG_CONTEXT_TEMPLATE.format(ctx="\n".join(ctx_lines)) if ctx_lines else ""
 
+# 既存の OBSERVER_JSON_PROMPT を置き換え
 OBSERVER_JSON_PROMPT = (
     "You are a creative research ideator.\n"
     "Given the TOPIC, PROBLEM, and SOURCE DOMAINS, propose ONE research idea.\n"
@@ -399,17 +486,39 @@ OBSERVER_JSON_PROMPT = (
     "Schema (keys required): {{\"input_concepts\":[\"...\"], \"new_concepts\":[\"...\"], "
     "\"bridge_rationale\":\"...\", \"plan\":\"...\", \"risks\":[\"...\"], "
     "\"title\":\"...\", \"abstract\":\"...\"}}\n\n"
+    "Example (very short):\n"
+    "{{\n"
+    "  \"input_concepts\": [\"vision\"],\n"
+    "  \"new_concepts\": [\"robotics\"],\n"
+    "  \"bridge_rationale\": \"Combine visual grounding with robotic planning.\",\n"
+    "  \"plan\": \"Link perception to action with a small prototype pipeline.\",\n"
+    "  \"risks\": [\"data scarcity\"],\n"
+    "  \"title\": \"Vision-Guided Robotic Planning\",\n"
+    "  \"abstract\": \"Connect computer vision to robot task planning with a minimal pipeline.\"\n"
+    "}}\n\n"
     "Requirements: encourage bisociation (combine distant concepts).\n"
     "Return JSON only. No prose outside JSON.\n\n"
     "{rag_block}"
 )
 
+# 既存の PIONEER_REFINE_JSON_PROMPT を置き換え
 PIONEER_REFINE_JSON_PROMPT = (
     "You are a research editor improving feasibility and clarity.\n"
     "Refine the JSON idea to reduce risks and increase feasibility, while preserving novelty.\n"
     "Return JSON only. No extra text.\n\n"
+    "Example (very short):\n"
+    "{\n"
+    "  \"input_concepts\": [\"vision\"],\n"
+    "  \"new_concepts\": [\"robotics\"],\n"
+    "  \"bridge_rationale\": \"...\",\n"
+    "  \"plan\": \"...\",\n"
+    "  \"risks\": [\"...\"],\n"
+    "  \"title\": \"...\",\n"
+    "  \"abstract\": \"...\"\n"
+    "}\n\n"
     "{idea_json}\n\n{rag_block}"
 )
+
 
 def build_observer_prompt(seed: SeedItem, ctx_docs: int = 5) -> str:
     rag_block = build_ctx_block(seed.__dict__, max_docs=ctx_docs)
@@ -466,6 +575,8 @@ class GenCfg:
     top_p: float
     top_k: int
     repetition_penalty: float
+    no_repeat_ngram_size: int = 3     # ← 追加
+    do_sample: bool = True            # ← 追加
 
 def generate_texts(ppo_trainer, prompts: List[str], cfg: GenCfg) -> List[str]:
     out = ppo_trainer.generate(
@@ -475,6 +586,7 @@ def generate_texts(ppo_trainer, prompts: List[str], cfg: GenCfg) -> List[str]:
         top_k=cfg.top_k,
         temperature=cfg.temperature,
         repetition_penalty=cfg.repetition_penalty,
+        no_repeat_ngram_size=cfg.no_repeat_ngram_size,  # ← 追加
         min_new_tokens=cfg.min_new_tokens,
         max_new_tokens=cfg.max_new_tokens,
         pad_token_id=ppo_trainer.tokenizer.eos_token_id,
@@ -562,11 +674,26 @@ def main(args: TrainArgs):
     seeds = load_seeds(args.seeds_path, limit=args.max_seeds)
 
     # 生成設定
-    cfg_obs = GenCfg(min_new_tokens=args.min_new_tokens, max_new_tokens=args.max_new_tokens,
-                     temperature=args.temperature, top_p=args.top_p, top_k=args.top_k,
-                     repetition_penalty=1.0)
-    cfg_pio = GenCfg(min_new_tokens=128, max_new_tokens=min(700, args.max_new_tokens),
-                     temperature=0.7, top_p=0.9, top_k=args.top_k, repetition_penalty=1.05)
+    cfg_obs = GenCfg(
+        min_new_tokens=args.min_new_tokens,
+        max_new_tokens=args.max_new_tokens,
+        temperature=0.4,             # ← 0.7 から下げる
+        top_p=args.top_p,
+        top_k=args.top_k,
+        repetition_penalty=1.1,      # ← 1.0 → 1.1
+        no_repeat_ngram_size=4,      # ← 追加
+        do_sample=True               # ← 追加
+    )
+    cfg_pio = GenCfg(
+        min_new_tokens=128,
+        max_new_tokens=min(700, args.max_new_tokens),
+        temperature=0.4,             # ← 0.7 → 0.4
+        top_p=0.9,
+        top_k=args.top_k,
+        repetition_penalty=1.1,      # ← 1.05 → 1.1
+        no_repeat_ngram_size=4,      # ← 追加
+        do_sample=True               # ← 追加
+    )
 
     reward_hist: List[float] = []
 
@@ -596,19 +723,46 @@ def main(args: TrainArgs):
         # --- Observer ---
         obs_prompts = [build_observer_prompt(s, ctx_docs=5) for s in batch]
         resp_obs = generate_texts(ppo_trainer, obs_prompts, cfg_obs)
-        obs_jsons = [try_parse_json(t) for t in resp_obs]
+        resp_obs = _strip_echo(obs_prompts, resp_obs)  # プロンプトのエコーを除去
+        obs_jsons = [try_parse_json_relaxed(t) for t in resp_obs]  # ゴミ混入でもJSON部だけ抽出
         obs_valid = [x if (x and validate_schema(x)) else None for x in obs_jsons]
 
-        # --- Pioneer ---
+        # --- Pioneer（Observer失敗サンプルはスキップ） ---
         pio_prompts = []
+        mask_do_pio = []
         for s, idea in zip(batch, obs_valid):
             if idea is None:
-                pio_prompts.append(PIONEER_REFINE_JSON_PROMPT.format(idea_json="{}", rag_block=build_ctx_block(s.__dict__)))
+                mask_do_pio.append(False)
+                pio_prompts.append(None)
             else:
+                mask_do_pio.append(True)
                 pio_prompts.append(build_pioneer_prompt(idea, s, ctx_docs=5))
-        resp_pio = generate_texts(ppo_trainer, pio_prompts, cfg_pio)
-        pio_jsons = [try_parse_json(t) for t in resp_pio]
+
+        # 実際に生成するのは有効サンプルだけ
+        indices = [i for i, ok in enumerate(mask_do_pio) if ok]
+        resp_pio = [None] * len(batch)
+        if indices:
+            sub_prompts = [pio_prompts[i] for i in indices]
+            sub_resp = generate_texts(ppo_trainer, sub_prompts, cfg_pio)
+            sub_resp = _strip_echo(sub_prompts, sub_resp)
+            for i, r in zip(indices, sub_resp):
+                resp_pio[i] = r
+
+        # 以降の処理で落ちないよう、None→空文字に正規化
+        resp_pio = [r if isinstance(r, str) else "" for r in resp_pio]
+
+        # PioneerのJSONパース（緩和版）
+        pio_jsons = [try_parse_json_relaxed(t) for t in resp_pio]
         pio_valid = [x if (x and validate_schema(x)) else None for x in pio_jsons]
+        
+        if args.print_every_steps and (step % args.print_every_steps == 0):
+            obs_pairs = list(zip(obs_prompts, resp_obs))[: max(1, args.print_n_samples)]
+            pio_pairs = list(zip(pio_prompts, resp_pio))[: max(1, args.print_n_samples)]
+
+            print(f"\n\n######## EVAL SNAPSHOT @ step {step} ########")
+            _print_samples("OBSERVER (idea proposal JSON)", obs_pairs, args.print_prompt_max_chars)
+            _print_samples("PIONEER (refine JSON)", pio_pairs, args.print_prompt_max_chars)
+            print("######## END SNAPSHOT ########\n")
 
         # --- IRM scores（空文字禁止：緩い整形＋フォールバックで必ず非空に） ---
         idea_obs_texts: List[str] = []
@@ -637,19 +791,29 @@ def main(args: TrainArgs):
         raw_obs_t, n01_obs_t = irm_reward.score(idea_obs_texts)
         raw_pio_t, n01_pio_t = irm_reward.score(idea_pio_texts)
 
-        # --- PPO updates ---
+        # --- PPO updates --- の直前あたり（raw_obs_t, n01_obs_t 取得後）
+        r_obs = scale_rewards(raw_obs_t, n01_obs_t)
+        # JSON妥当性シェーピング（例）
+        for i, valid in enumerate(obs_valid):
+            r_obs[i] = r_obs[i] + (0.2 if valid is not None else -0.5)
+
         stats_obs = {}
         stats_pio = {}
+
         try:
-            stats_obs = ppo_trainer.step(prompts=obs_prompts, responses=resp_obs,
-                                         rewards=scale_rewards(raw_obs_t, n01_obs_t))
+            # ★ 位置引数で渡す（queries, responses, rewards）
+            stats_obs = ppo_trainer.step(obs_prompts, resp_obs, r_obs)
         except Exception:
             pass
 
         if (step % max(1, args.swap_every)) == 0:
             try:
-                stats_pio = ppo_trainer.step(prompts=pio_prompts, responses=resp_pio,
-                                             rewards=scale_rewards(raw_pio_t, n01_pio_t))
+                r_pio = scale_rewards(raw_pio_t, n01_pio_t)
+                for i, valid in enumerate(pio_valid):
+                    r_pio[i] = r_pio[i] + (0.2 if valid is not None else -0.5)
+
+                # ★ こちらも位置引数
+                stats_pio = ppo_trainer.step(pio_prompts, resp_pio, r_pio)
             except Exception:
                 pass
 

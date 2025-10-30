@@ -1,855 +1,638 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-CREA-Bridge (single-file, simple & robust)
-- Pipeline: Observer(JSON) -> Pioneer(JSON) with small Bridger hints
-- Reward: IRM regression head (optionally sliding-window + calibration) -> scaled (zscore→tanh or calibrated prob)
-- Training: TRL PPOTrainer if available; else fall back to NO-PPO (generate+score)
-- Orchestration: Accelerate; Deepspeed via Accelerate if --use-deepspeed is passed
-- Logging: wandb (disable with --disable-wandb)
+CREA-Bridge (PPO-only version, robust JSON & reward logging)
+- Bridger → Pioneer → Observer の3段生成 + IRMスコアリング + PPO学習のみ
+- NO-PPOフォールバックは削除（PPO初期化失敗時はエラーで終了）
+- 生成出力からJSONを強制抽出（壊れたJSONや前置き混入に耐性）
+- 毎ステップの報酬（生/EMA/平均）をW&Bへ記録、一定間隔で生出力をTableに保存
 
-Notes:
-- Keep dependencies modest; fail-safe fallbacks with explicit debug prints
-- HF datasets required for PPO dataset stability
+実行例:
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python CREA-Bridge.py \
+  --model-name Qwen/Qwen2.5-3B-Instruct \
+  --irm-model-dir ../IRM/irm_sci_huber_z_splitstats \
+  --irm-calib-path ../IRM/irm_sci_huber_z_splitstats/eval_summary_valid.json \
+  --seeds-path CORY_withRAG/data/research_seeds.fixed.jsonl \
+  --irm-use-sliding --irm-stride-ratio 0.75 --irm-agg median \
+  --total-steps 400 --ppo-epochs 1 --batch-size 1 --mini-batch-size 1 \
+  --max-new-tokens 64 --irm-max-len 384 \
+  --learning-rate 5e-6 --lora-r 16 --lora-alpha 16 --lora-dropout 0.05 \
+  --log-every-n 20
 """
 
-from __future__ import annotations
-import os, re, json, time, random, argparse, sys, traceback
+import os
+import sys
+import json
+import math
+import time
+import argparse
+import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from types import SimpleNamespace
+from typing import List, Optional, Dict, Any, Tuple
 
-import numpy as np
 import torch
+from torch.utils.data import Dataset
 
-# tqdm (optional)
+# tqdm（進捗表示）
 try:
-    from tqdm.auto import tqdm
+    from tqdm import trange
+    _HAS_TQDM = True
 except Exception:
-    def tqdm(it, **kw): return it
+    _HAS_TQDM = False
 
-# wandb (enabled by default; can be disabled via --disable-wandb)
+# Weights & Biases
 try:
     import wandb
     _HAS_WANDB = True
 except Exception:
     _HAS_WANDB = False
-    class _W:  # dummy
-        def init(self, **k): pass
-        def log(self, d): pass
-    wandb = _W()
 
-# Deepspeed (optional; used via Accelerate)
-try:
-    import deepspeed  # noqa: F401
-    _HAS_DS = True
-except Exception:
-    _HAS_DS = False
-
-# Transformers
+# Transformers / TRL / PEFT
 from transformers import (
     AutoTokenizer,
-    AutoModelForSequenceClassification,
+    AutoConfig,
     AutoModelForCausalLM,
 )
-from transformers.utils import is_bitsandbytes_available
 try:
-    from transformers import BitsAndBytesConfig
+    from trl import AutoModelForCausalLMWithValueHead
+    _HAS_VHEAD = True
 except Exception:
-    BitsAndBytesConfig = None
+    _HAS_VHEAD = False
 
-# TRL (optional)
-_HAS_TRL = True
 try:
-    from trl import PPOConfig, PPOTrainer, AutoModelForCausalLMWithValueHead
+    from trl import PPOTrainer
+    _HAS_TRL = True
 except Exception:
     _HAS_TRL = False
 
-# datasets (required for PPO dataset)
-from datasets import Dataset as HFDataset
-
-# peft (optional for LoRA)
 try:
     from peft import LoraConfig, get_peft_model
     _HAS_PEFT = True
 except Exception:
     _HAS_PEFT = False
 
-# ================================================================
-# JSON utils (robust but minimal)
-# ================================================================
-REQUIRED_KEYS = ["input_concepts","new_concepts","bridge_rationale","plan","risks","title","abstract"]
-_JSON_TITLE_RE = re.compile(r'"title"\s*:\s*"([^"]+)"', re.S)
-_JSON_ABS_RE   = re.compile(r'"abstract"\s*:\s*"([^"]+)"', re.S)
+# IRM 用
+try:
+    from transformers import AutoModelForSequenceClassification
+    _HAS_IRM = True
+except Exception:
+    _HAS_IRM = False
 
-def _strip_nonjson_tail(s: str) -> str:
-    if not s: return s
-    i, j = s.find('{'), s.rfind('}')
-    return s[i:j+1] if (i != -1 and j != -1 and j > i) else s
 
-def try_parse_json(s: str) -> Optional[Dict[str, Any]]:
-    if not s: return None
-    s1 = _strip_nonjson_tail(s).replace("\r","")
-    s1 = re.sub(r',\s*([}\]])', r'\1', s1)
+# -----------------------------------------
+# ユーティリティ
+# -----------------------------------------
+def set_default_dtype_bf16_if_available():
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        torch.set_default_dtype(torch.bfloat16)
+
+def device_map_auto():
+    return "auto" if torch.cuda.is_available() else None
+
+def get_model_device(m) -> torch.device:
+    """TRLのv-headラッパ等でも確実にデバイスを得る"""
+    if hasattr(m, "device"):
+        return m.device
     try:
-        return json.loads(s1)
+        return m.pretrained_model.device  # TRLのラッパ
     except Exception:
-        return None
+        return next(m.parameters()).device  # 最低限
 
-def validate_schema(obj: Dict[str, Any]) -> bool:
-    if not isinstance(obj, dict): return False
-    for k in REQUIRED_KEYS:
-        if k not in obj: return False
-        v = obj[k]
-        if isinstance(v, str) and len(v.strip()) < 5: return False
-        if isinstance(v, list) and len(v) == 0: return False
-    ic = obj.get("input_concepts", []); nc = obj.get("new_concepts", [])
-    if isinstance(ic, list) and isinstance(nc, list):
-        if set(map(str.lower, ic)) == set(map(str.lower, nc)): return False
-    return True
-
-def make_irm_text_from_idea_relaxed(idea: Dict[str, Any]) -> str:
-    if not isinstance(idea, dict): return ""
-    t = str(idea.get("title","")).strip()
-    a = str(idea.get("abstract","")).strip()
-    b = str(idea.get("bridge_rationale","")).strip()
-    p = str(idea.get("plan","")).strip()
-    parts = []
-    if t: parts.append(t)
-    if a: parts.append(a)
-    if b: parts.append(f"Bridge: {b}")
-    if p: parts.append(f"Plan: {p}")
-    return "\n\n".join(parts) if parts else ""
-
-def fallback_irm_text_from_raw_response(resp_text: str, seed_problem: str = "") -> str:
-    if not resp_text:
-        head = seed_problem.strip() or "Generated Idea"
-        return f"{head}\n\nEmpty response."
-    s = _strip_nonjson_tail(resp_text)
-    mt, ma = _JSON_TITLE_RE.search(s), _JSON_ABS_RE.search(s)
-    if mt or ma:
-        t = mt.group(1).strip() if mt else ""
-        a = ma.group(1).strip() if ma else s[:1000]
-        return (t + "\n\n" + a).strip()
-    body = s.strip()[:1600]
-    head = seed_problem.strip() or "Generated Idea"
-    return f"{head}\n\n{body}"
-
-# ================================================================
-# IRM reward (sliding window + optional calibration)
-# ================================================================
-def _build_piecewise_calibrator_from_buckets(buckets: List[dict]):
-    xs, ys = [], []
-    for b in buckets:
-        if "pred_mean" in b and "true_mean" in b:
-            xs.append(float(b["pred_mean"]))
-            ys.append(float(b["true_mean"]))
-    if len(xs) < 2:
-        return lambda v: float(np.clip(v, 0.0, 1.0))
-    xs, ys = np.array(xs), np.array(ys)
-    order = np.argsort(xs)
-    xs, ys = xs[order], np.maximum.accumulate(ys[order])
-    def f(v: float) -> float:
-        return float(np.interp(v, xs, ys, left=ys[0], right=ys[-1]))
-    return f
-
-class IRMReward:
-    def __init__(self, irm_model_dir: str, max_length: int = 512,
-                 device: Optional[torch.device] = None,
-                 quantization: str = "none", torch_dtype: str = "auto",
-                 use_sliding: bool = False, stride_ratio: float = 0.5, agg: str = "mean",
-                 calib_path: Optional[str] = None):
-        self.max_length = max_length
-        self.device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
-        self.tok = AutoTokenizer.from_pretrained(irm_model_dir, use_fast=True)
-
-        self.use_sliding = bool(use_sliding)
-        self.stride_ratio = float(max(0.01, min(0.99, stride_ratio)))
-        self.agg = (agg or "mean").lower().strip()
-        self.calib_fn = None
-
-        # model load
-        dtype = None
-        if torch_dtype == "float16": dtype = torch.float16
-        elif torch_dtype == "bfloat16": dtype = torch.bfloat16
-        elif torch_dtype == "float32": dtype = torch.float32
-
-        if quantization in ("8bit","4bit") and is_bitsandbytes_available() and BitsAndBytesConfig is not None:
-            m = AutoModelForSequenceClassification.from_pretrained(
-                irm_model_dir,
-                torch_dtype=(torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else
-                             (torch.float16 if torch.cuda.is_available() else torch.float32)),
-                low_cpu_mem_usage=True
-            )
-            m.to(self.device).eval()
-            self.model = m
+class EMA:
+    def __init__(self, beta=0.9):
+        self.beta = beta
+        self.value = None
+    def update(self, x: float) -> float:
+        if x is None or (isinstance(x, float) and (x != x)):  # NaN guard
+            return self.value if self.value is not None else float("nan")
+        if self.value is None:
+            self.value = x
         else:
-            kw = {}
-            if dtype is not None: kw["torch_dtype"] = dtype
-            try:
-                m = AutoModelForSequenceClassification.from_pretrained(irm_model_dir, low_cpu_mem_usage=True, **kw)
-                m.to(self.device).eval()
-                self.model = m
-            except RuntimeError:
-                try:
-                    import gc; gc.collect()
-                    if torch.cuda.is_available(): torch.cuda.empty_cache()
-                except Exception: pass
-                cpu = torch.device("cpu")
-                m = AutoModelForSequenceClassification.from_pretrained(irm_model_dir, low_cpu_mem_usage=True, **kw)
-                m.to(cpu).eval()
-                self.model = m
+            self.value = self.beta * self.value + (1 - self.beta) * x
+        return self.value
 
-        if calib_path and os.path.isfile(calib_path):
+def _balance_brackets(s: str, open_ch: str, close_ch: str) -> str:
+    """開き/閉じの数がズレていた場合に末尾へ閉じ括弧を補う"""
+    cnt = 0
+    out = []
+    for ch in s:
+        if ch == open_ch:
+            cnt += 1
+        elif ch == close_ch:
+            cnt -= 1
+        out.append(ch)
+    out_str = "".join(out)
+    if cnt > 0:
+        out_str += close_ch * cnt
+    return out_str
+
+def extract_first_json(text: str):
+    """
+    入力テキストから最初の JSON オブジェクト/配列を取り出して json.loads する。
+    - 先頭の説明文/余計な文字列は自動で捨てる
+    - 未閉じ括弧は自動補完
+    失敗時は None を返す
+    """
+    if not text:
+        return None
+    starts = []
+    i1 = text.find("{")
+    i2 = text.find("[")
+    if i1 != -1:
+        starts.append(("obj", i1))
+    if i2 != -1:
+        starts.append(("arr", i2))
+    if not starts:
+        return None
+    kind, i = min(starts, key=lambda x: x[1])
+    frag = text[i:]
+    if kind == "obj":
+        candidate = _balance_brackets(frag, "{", "}")
+    else:
+        candidate = _balance_brackets(frag, "[", "]")
+    last_obj = candidate.rfind("}")
+    last_arr = candidate.rfind("]")
+    last = max(last_obj, last_arr)
+    if last != -1:
+        candidate = candidate[: last + 1]
+    try:
+        return json.loads(candidate)
+    except Exception:
+        for cut in (16, 64, 256):
             try:
-                with open(calib_path, "r", encoding="utf-8") as f:
-                    js = json.load(f)
-                buckets = js.get("calibration_buckets_reward") or js.get("calibration_buckets")
-                if isinstance(buckets, list) and buckets:
-                    self.calib_fn = _build_piecewise_calibrator_from_buckets(buckets)
+                c2 = candidate[:-cut]
+                if not c2:
+                    break
+                if kind == "obj":
+                    c2 = _balance_brackets(c2, "{", "}")
+                else:
+                    c2 = _balance_brackets(c2, "[", "]")
+                return json.loads(c2)
             except Exception:
-                self.calib_fn = None
-
-    def _windows_of(self, text: str) -> List[str]:
-        ids = self.tok(text, add_special_tokens=False)["input_ids"]
-        L = len(ids)
-        if L <= self.max_length: return [text]
-        stride = max(1, int(self.max_length * (1.0 - self.stride_ratio)))
-        chunks = []
-        for start in range(0, L, stride):
-            end = start + self.max_length
-            sub_ids = ids[start:end]
-            if not sub_ids: continue
-            chunks.append(self.tok.decode(sub_ids, skip_special_tokens=True))
-            if end >= L: break
-        return chunks
-
-    @torch.no_grad()
-    def _score_logits(self, texts: List[str]) -> torch.Tensor:
-        enc = self.tok(texts, max_length=self.max_length, truncation=True, padding=True, return_tensors="pt")
-        dev = next(self.model.parameters()).device
-        enc = {k:(v.to(dev) if torch.is_tensor(v) else v) for k,v in enc.items()}
-        logits = self.model(**enc).logits.squeeze(-1).detach().float()
-        return logits
-
-    @torch.no_grad()
-    def score(self, idea_texts: List[str]) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        if not self.use_sliding:
-            raw = self._score_logits(idea_texts)
-        else:
-            all_chunks, owners = [], []
-            for bi, t in enumerate(idea_texts):
-                for w in self._windows_of(t):
-                    all_chunks.append(w); owners.append(bi)
-            chunk_logits = self._score_logits(all_chunks)
-            B = len(idea_texts)
-            rows = [[] for _ in range(B)]
-            for logit, bi in zip(chunk_logits.tolist(), owners): rows[bi].append(logit)
-            # aggregate
-            import math as _m
-            maxW = max(len(r) for r in rows)
-            arr = torch.full((B, maxW), float("nan"))
-            for i, row in enumerate(rows): arr[i, :len(row)] = torch.tensor(row)
-            mask = ~torch.isnan(arr); arr2 = torch.where(mask, arr, torch.zeros_like(arr))
-            meanv = (arr2.sum(dim=1) / mask.sum(dim=1).clamp(min=1))
-            if self.agg == "median":
-                out = []
-                for i in range(B):
-                    xs = arr[i][mask[i]].tolist()
-                    out.append(float(np.median(xs) if xs else 0.0))
-                raw = torch.tensor(out)
-            elif self.agg == "max":
-                raw = torch.where(mask, arr2, torch.full_like(arr2, -1e9)).max(dim=1).values
-            else:
-                raw = meanv
-        norm01 = torch.clamp((raw - 1.0)/9.0, 0.0, 1.0)
-        prob = None
-        if self.calib_fn is not None:
-            p = [self.calib_fn(float(x)) for x in norm01.tolist()]
-            prob = torch.tensor(p, dtype=torch.float32, device=norm01.device)
-        return raw.float(), norm01.float(), (prob.float() if prob is not None else None)
-
-# ================================================================
-# RAG / prompts
-# ================================================================
-@dataclass
-class SeedItem:
-    topic: str
-    problem: str
-    sources: List[str]
-    constraints: str = ""
-    context: List[Dict[str, Any]] = None
-    input_concepts: List[str] = None
-
-def load_seeds(path: str, limit: Optional[int] = None) -> List[SeedItem]:
-    seeds: List[SeedItem] = []
-    with open(path, "r", encoding="utf-8") as f:
-        for ln in f:
-            ln = ln.strip()
-            if not ln: continue
-            obj = json.loads(ln)
-            seeds.append(SeedItem(
-                topic=obj.get("topic",""),
-                problem=obj.get("problem",""),
-                sources=obj.get("sources",[]) or [],
-                constraints=obj.get("constraints",""),
-                context=obj.get("context",[]) or [],
-                input_concepts=obj.get("input_concepts",[]) or None,
-            ))
-            if limit is not None and len(seeds) >= limit: break
-    if not seeds: raise RuntimeError(f"no seeds at {path}")
-    return seeds
-
-RAG_CONTEXT_TEMPLATE = "\n---\nRAG_CONTEXT:\n{ctx}\n(Use the context only as background evidence. Do not copy; synthesize novel ideas.)\n"
-def build_ctx_block(seed: Dict[str, Any], max_docs: int = 5) -> str:
-    ctx_lines = []
-    for d in seed.get("context", [])[:max_docs]:
-        title = (d.get("title") or "").strip()
-        abstract = (d.get("abstract") or "").strip()
-        if not title and not abstract: continue
-        ctx_lines.append(f"- {title}\n  {abstract}")
-    return RAG_CONTEXT_TEMPLATE.format(ctx="\n".join(ctx_lines)) if ctx_lines else ""
-
-SCHEMA_JSON = json.dumps({
-    "input_concepts": ["..."],
-    "new_concepts": ["..."],
-    "bridge_rationale": "...",
-    "plan": "...",
-    "risks": ["..."],
-    "title": "...",
-    "abstract": "..."
-}, ensure_ascii=False)
-
-OBSERVER_JSON_PROMPT = (
-    "You are a creative research ideator.\n"
-    "Given the TOPIC, PROBLEM, and SOURCE DOMAINS, propose ONE research idea.\n"
-    "Respond ONLY in valid JSON matching the schema.\n\n"
-    "TOPIC: {topic}\n"
-    "PROBLEM: {problem}\n"
-    "SOURCES: {sources}\n"
-    "CONSTRAINTS: {constraints}\n\n"
-    "{input_hint}"
-    "Schema (keys required): {schema}\n\n"
-    "Requirements: encourage bisociation (combine distant concepts).\n"
-    "Return JSON only. No prose outside JSON.\n\n"
-    "{rag_block}"
-)
-PIONEER_REFINE_JSON_PROMPT = (
-    "You are a research editor improving feasibility and clarity.\n"
-    "Refine the JSON idea to reduce risks and increase feasibility, while preserving novelty.\n"
-    "Use the BRIDGE_HINTS to explicitly incorporate cross-domain connections.\n"
-    "Return JSON only. No extra text.\n\n"
-    "BRIDGE_HINTS: {bridge_hints}\n\n"
-    "{idea_json}\n\n{rag_block}"
-)
-
-def _extract_fields(seed: SeedItem) -> List[str]:
-    found = []
-    for d in seed.context or []:
-        for f in d.get("fields", []) or []:
-            if f and f not in found: found.append(f)
-    return found
-
-def _guess_input_concepts(seed: SeedItem, observer_json: Optional[Dict[str, Any]]) -> List[str]:
-    if observer_json and isinstance(observer_json.get("input_concepts"), list):
-        return [str(x).strip() for x in observer_json.get("input_concepts") if str(x).strip()]
-    if seed.input_concepts:
-        return [str(x).strip() for x in seed.input_concepts if str(x).strip()]
-    toks = re.split(r"[,/]|\\band\\b|\\+|\\|", seed.topic.lower())
-    toks = [t.strip() for t in toks if t.strip()]
-    return toks[:4]
-
-def build_bridge_hints(seed: SeedItem, observer_json: Optional[Dict[str, Any]], max_hints: int = 3) -> List[str]:
-    fields = _extract_fields(seed)
-    base = _guess_input_concepts(seed, observer_json)
-    pool = [f for f in fields if f and f.lower() not in {c.lower() for c in base}] or fields
-    random.shuffle(pool)
-    picks = pool[:max_hints]
-    hints = [f"Leverage domain '{f}' to connect with input concepts {base}." for f in picks]
-    fallback = [("control theory","text-to-policy distillation"),
-                ("graph signal processing","causal discovery"),
-                ("program synthesis","embodied evaluation"),
-                ("neurosymbolic reasoning","active learning")]
-    while len(hints) < max_hints and fallback:
-        a,b = fallback.pop(random.randrange(len(fallback)))
-        hints.append(f"Cross with {a} and {b} to induce bisociation.")
-    return hints[:max_hints]
-
-# ================================================================
-# Generation + reward scaling
-# ================================================================
-@dataclass
-class GenCfg:
-    min_new_tokens: int
-    max_new_tokens: int
-    temperature: float
-    top_p: float
-    top_k: int
-    repetition_penalty: float
-
-class EMAStats:
-    def __init__(self, decay: float = 0.99):
-        self.decay=decay; self._mean=None; self._var=None; self._eps=1e-6
-    def update(self, x: torch.Tensor):
-        x = x.detach().float().mean()
-        if self._mean is None:
-            self._mean = x; self._var = torch.tensor(1.0, device=x.device)
-        else:
-            self._mean = self.decay*self._mean + (1-self.decay)*x
-            self._var  = self.decay*self._var  + (1-self.decay)*(x-self._mean).pow(2)
-    @property
-    def mean(self): return float(self._mean.item() if self._mean is not None else 0.0)
-    @property
-    def std(self):  return float(torch.sqrt((self._var or torch.tensor(1.0))+self._eps).item())
-
-def build_reward_scaler(mode: str = "raw_zscore_tanh", beta: float = 1.5):
-    ema_raw = EMAStats(0.99); ema_prob = EMAStats(0.99)
-    def scale(raw: torch.Tensor, n01: torch.Tensor, prob: Optional[torch.Tensor]) -> List[torch.Tensor]:
-        m = (mode or "raw_zscore_tanh")
-        b = float(beta)
-        if m == "raw_identity":
-            r = raw.float()
-        elif m == "raw_zscore_tanh":
-            ema_raw.update(raw); z = (raw.float()-ema_raw.mean)/max(ema_raw.std,1e-6); r = torch.tanh(z*b)
-        elif m == "norm01_identity":
-            r = n01.float()
-        elif m == "norm01_zscore_tanh":
-            ema_raw.update(n01); z = (n01.float()-ema_raw.mean)/max(ema_raw.std,1e-6); r = torch.tanh(z*b)
-        elif m == "calibrated_prob" and prob is not None:
-            ema_prob.update(prob); z = (prob.float()-ema_prob.mean)/max(ema_prob.std,1e-6); r = torch.tanh(z*b)
-        else:
-            r = n01.float()
-        return [ri.detach() for ri in r]
-    return scale
-
-# ================================================================
-# PPO trainer helpers
-# ================================================================
-def _record_to_prompt(rec: Dict[str, Any]) -> Optional[str]:
-    if not isinstance(rec, dict): return None
-    if "prompt" in rec and isinstance(rec["prompt"], str) and rec["prompt"].strip():
-        return rec["prompt"].strip()
-    topic = rec.get("topic"); problem = rec.get("problem"); constraints = rec.get("constraints"); sources = rec.get("sources"); ctx_list = rec.get("context")
-    if isinstance(sources, list): src_txt = ", ".join(map(str, sources))
-    elif isinstance(sources, str): src_txt = sources
-    else: src_txt = ""
-    ctx_lines = []
-    if isinstance(ctx_list, list):
-        for c in ctx_list[:5]:
-            if isinstance(c, dict):
-                t=c.get("title",""); a=c.get("abstract",""); fields=c.get("fields",[])
-                fields_str=", ".join(fields) if isinstance(fields,list) else str(fields)
-                ctx_lines.append(f"- {t} | fields: {fields_str} | abs: {a}")
-            else:
-                ctx_lines.append(f"- {str(c)}")
-    headline = problem or topic or "Creative research idea generation"
-    base = [f"Topic: {topic}" if topic else None,
-            f"Problem: {problem}" if problem else None,
-            f"Sources/Fields: {src_txt}" if src_txt else None,
-            f"Constraints: {constraints}" if constraints else None]
-    base = [b for b in base if b]
-    ctx_block = "Context papers:\n" + "\n".join(ctx_lines[:10]) if ctx_lines else ""
-    prompt = (f"{headline}\n" + ("\n".join(base)+"\n" if base else "") +
-              (ctx_block+"\n\n" if ctx_block else "") +
-              "Give me three concrete, novel, and feasible research ideas that bridge distant fields above. "
-              "Each idea must include: (1) title, (2) 2–3 sentence rationale, (3) minimal viable experiment with metrics, (4) risks+mitigations.")
-    return prompt
-
-def _load_prompts_from_jsonl(path: str, max_seeds: Optional[int]) -> List[str]:
-    prompts: List[str] = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-                p = _record_to_prompt(rec)
-                if p and p.strip():
-                    prompts.append(p.strip())
-            except json.JSONDecodeError:
-                if line.strip():
-                    prompts.append(line.strip())
-    random.shuffle(prompts)
-    if max_seeds and max_seeds > 0:
-        prompts = prompts[:max_seeds]
-
-    # ★ ここを強化：必ず十分な個数にする
-    base_prompt = "Give me three creative research ideas that connect LLMs × Reinforcement Learning."
-    if len(prompts) < 32:
-        need = 32 - len(prompts)
-        prompts.extend([base_prompt] * need)
-
-    return prompts
-
-def _build_hfdataset(prompts: List[str]):
-    return HFDataset.from_dict({"prompt": prompts})
-
-def _build_ppo_trainer(model, tokenizer, seeds_path: str, max_seeds: Optional[int],
-                       learning_rate: float, batch_size: int, mini_batch_size: int, ppo_epochs: int,
-                       lora_r: int, lora_alpha: int, lora_dropout: float):
-    if not _HAS_TRL:
-        print("[DEBUG] TRL not available.")
-        return None
-
-    prompts = _load_prompts_from_jsonl(seeds_path, max_seeds)
-    dataset = _build_hfdataset(prompts)
-
-    # Optional LoRA
-    if lora_r and lora_r>0 and _HAS_PEFT:
-        lora_cfg = LoraConfig(r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
-                              bias="none", task_type="CAUSAL_LM",
-                              target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"])
-        policy = model.pretrained_model
-        policy = get_peft_model(policy, lora_cfg)
-        model.pretrained_model = policy
-        try: model.pretrained_model.config.use_cache = False
-        except Exception: pass
-
-    # PPO config
-    ppo_config = PPOConfig(learning_rate=learning_rate, batch_size=batch_size, mini_batch_size=mini_batch_size,seed=42)
-    if hasattr(ppo_config, "use_reference_model"): ppo_config.use_reference_model = False
-    if hasattr(ppo_config, "ppo_epochs"): ppo_config.ppo_epochs = ppo_epochs
-    elif hasattr(ppo_config, "epochs"): ppo_config.epochs = ppo_epochs
-
-    # Try multiple constructor signatures (robust to TRL API drift)
-    for attempt in range(4):
-        try:
-            if attempt == 0:
-                return PPOTrainer(config=ppo_config, model=model, ref_model=None,
-                                  tokenizer=tokenizer, dataset=dataset, data_collator=None)
-            elif attempt == 1:
-                return PPOTrainer(ppo_config, model, None, tokenizer, dataset, None)
-            elif attempt == 2:
-                return PPOTrainer(model=model, tokenizer=tokenizer, dataset=dataset, data_collator=None)
-            else:
-                # dataset=None path (rarely needed, but increases init pass rate)
-                return PPOTrainer(config=ppo_config, model=model, ref_model=None,
-                                  tokenizer=tokenizer, dataset=None, data_collator=None)
-        except Exception as e:
-            print(f"[DEBUG] PPOTrainer init attempt {attempt} failed: {type(e).__name__}: {e}", file=sys.stderr)
-            traceback.print_exc()
+                pass
     return None
 
-def generate_texts_with_trl(ppo_trainer, prompts: List[str], cfg: GenCfg) -> List[str]:
-    tokenizer = getattr(ppo_trainer, "tokenizer", None)
-    model = getattr(ppo_trainer, "model", None)
-    if tokenizer is None or model is None:
-        raise RuntimeError("trainer missing tokenizer/model")
-    device = getattr(getattr(ppo_trainer, "accelerator", None), "device", None)
-    device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
 
-    enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=1024)
-    enc = {k:v.to(device) for k,v in enc.items()}
-    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-    eos_id = tokenizer.eos_token_id
-    gen = model.pretrained_model.generate(
-        **enc, do_sample=True, top_p=cfg.top_p, top_k=cfg.top_k, temperature=cfg.temperature,
-        repetition_penalty=cfg.repetition_penalty, min_new_tokens=cfg.min_new_tokens,
-        max_new_tokens=cfg.max_new_tokens, pad_token_id=pad_id, eos_token_id=eos_id,
-    )
-    input_len = enc["input_ids"].shape[1]
-    new_tokens = gen[:, input_len:]
-    texts = tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
-    return texts
+# -----------------------------------------
+# データセット（Seeds JSONL → Prompts）
+# -----------------------------------------
+class PromptDataset(Dataset):
+    def __init__(self, prompts: List[str]):
+        self.prompts = prompts
+    def __len__(self):
+        return len(self.prompts)
+    def __getitem__(self, idx):
+        return {"prompt": self.prompts[idx]}
 
-# ================================================================
-# Main
-# ================================================================
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model-name", type=str, default="Qwen/Qwen2.5-3B-Instruct")
-    ap.add_argument("--trust-remote-code", action="store_true")
-
-    # PPO
-    ap.add_argument("--learning-rate", type=float, default=5e-6)
-    ap.add_argument("--batch-size", type=int, default=2)
-    ap.add_argument("--mini-batch-size", type=int, default=1)
-    ap.add_argument("--ppo-epochs", type=int, default=2)
-    ap.add_argument("--total-steps", type=int, default=2000)
-    ap.add_argument("--swap-every", type=int, default=5)
-
-    # LoRA
-    ap.add_argument("--lora-r", type=int, default=16)
-    ap.add_argument("--lora-alpha", type=int, default=16)
-    ap.add_argument("--lora-dropout", type=float, default=0.05)
-
-    # Generation
-    ap.add_argument("--min-new-tokens", type=int, default=64)
-    ap.add_argument("--max-new-tokens", type=int, default=192)
-    ap.add_argument("--top-k", type=int, default=50)
-    ap.add_argument("--top-p", type=float, default=0.9)
-    ap.add_argument("--temperature", type=float, default=0.7)
-    ap.add_argument("--repetition-penalty", type=float, default=1.05)
-
-    # IRM
-    ap.add_argument("--irm-model-dir", type=str, default="./IRM/irm_sci_huber_z_splitstats")
-    ap.add_argument("--irm-max-len", type=int, default=512)
-    ap.add_argument("--irm-quantization", type=str, default="none", choices=["none","8bit","4bit"])
-    ap.add_argument("--irm-torch-dtype", type=str, default="auto", choices=["auto","float16","bfloat16","float32"])
-    ap.add_argument("--irm-use-sliding", action="store_true")
-    ap.add_argument("--irm-stride-ratio", type=float, default=0.5)
-    ap.add_argument("--irm-agg", type=str, default="median", choices=["mean","median","max"])
-    ap.add_argument("--irm-calib-path", type=str, default=None)
-
-    # Reward scaling
-    ap.add_argument("--reward-scale-mode", type=str, default="calibrated_prob",
-                    choices=["raw_identity","raw_zscore_tanh","norm01_identity","norm01_zscore_tanh","calibrated_prob"])
-    ap.add_argument("--reward-scale-beta", type=float, default=1.5)
-
-    # Data
-    ap.add_argument("--seeds-path", type=str, default="./data/research_seeds.jsonl")
-    ap.add_argument("--max-seeds", type=int, default=2000)
-
-    # Logging / run meta
-    ap.add_argument("--group", type=str, default="cory-crea-bridge")
-    ap.add_argument("--run-name", type=str, default=f"cory-crea-bridge-{int(time.time())}")
-    ap.add_argument("--disable-wandb", action="store_true")
-
-    # Deepspeed via Accelerate
-    ap.add_argument("--use-deepspeed", action="store_true",
-                    help="Set ACCELERATE_USE_DEEPSPEED=1 for PPO/Accelerate backend (requires accelerate config).")
-
-    args = ap.parse_args()
-
-    # Deepspeed (via accelerate)
-    if args.use_deepspeed:
-        os.environ["ACCELERATE_USE_DEEPSPEED"] = "true"
-        print("[INFO] Using Deepspeed via Accelerate. Ensure your accelerate config/yaml enables Deepspeed.")
-
-    # wandb
-    if not args.disable_wandb and _HAS_WANDB:
-        try:
-            wandb.init(project=args.group, name=args.run_name)
-        except Exception as e:
-            print(f"[WARN] wandb init failed: {e}")
-
-    # Tokenizer (left padding)
-    gen_tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=args.trust_remote_code)
-    gen_tokenizer.padding_side = "left"
-    if gen_tokenizer.pad_token is None:
-        gen_tokenizer.pad_token = gen_tokenizer.eos_token
-
-    # IRM
-    irm_reward = IRMReward(
-        irm_model_dir=args.irm_model_dir, max_length=args.irm_max_len,
-        device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-        quantization=args.irm_quantization, torch_dtype=args.irm_torch_dtype,
-        use_sliding=args.irm_use_sliding, stride_ratio=args.irm_stride_ratio,
-        agg=args.irm_agg, calib_path=args.irm_calib_path,
-    )
-    scale_rewards = build_reward_scaler(args.reward_scale_mode, args.reward_scale_beta)
-
-    # Seeds
-    try:
-        seeds = load_seeds(args.seeds_path, limit=args.max_seeds)
-    except Exception as e:
-        print(f"[WARN] load_seeds failed: {e}")
-        seeds = []
-
-    # PPO model/trainer
-    ppo_trainer = None
-    if _HAS_TRL:
-        policy = AutoModelForCausalLMWithValueHead.from_pretrained(
-            args.model_name, trust_remote_code=args.trust_remote_code,
-            torch_dtype=(torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else
-                         (torch.float16 if torch.cuda.is_available() else torch.float32)),
-            device_map="auto",
-        )
-        try:
-            policy.pretrained_model.config.use_cache = False
-        except Exception:
-            pass
-
-        ppo_trainer = _build_ppo_trainer(
-            policy, gen_tokenizer,
-            seeds_path=args.seeds_path, max_seeds=args.max_seeds,
-            learning_rate=args.learning_rate, batch_size=args.batch_size,
-            mini_batch_size=args.mini_batch_size, ppo_epochs=args.ppo_epochs,
-            lora_r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout
-        )
-
-    # Generation configs
-    cfg_obs = GenCfg(args.min_new_tokens, args.max_new_tokens, args.temperature, args.top_p, args.top_k, 1.0)
-    cfg_pio = GenCfg(128, min(700, args.max_new_tokens), 0.7, 0.9, args.top_k, 1.05)
-
-    # Prompt builders
-    def build_observer_prompt(s: SeedItem, ctx_docs: int = 5) -> str:
-        rag_block = build_ctx_block(s.__dict__, max_docs=ctx_docs)
-        ics = (s.input_concepts or [])
-        input_hint = f"INPUT_CONCEPTS_HINT: {', '.join(ics)}\n" if ics else ""
-        return OBSERVER_JSON_PROMPT.format(
-            topic=s.topic, problem=s.problem, sources=", ".join(s.sources),
-            constraints=s.constraints or "", input_hint=input_hint,
-            rag_block=rag_block, schema=SCHEMA_JSON
-        )
-
-    def batch_iterator(data, batch_size):
-        i=0; pool=data[:]; random.shuffle(pool)
-        while True:
-            if not pool: raise RuntimeError("no seeds")
-            if batch_size>len(pool): yield random.choices(pool, k=batch_size)
-            else:
-                if i+batch_size>len(pool): random.shuffle(pool); i=0
-                yield pool[i:i+batch_size]; i+=batch_size
-
-    # === NO-PPO fallback ===
-    if ppo_trainer is None:
-        print("[INFO] PPO unavailable -> NO-PPO (generation + IRM scoring only).")
-        head = seeds[:max(1, min(8, len(seeds) or 1))]
-        obs_prompts = [build_observer_prompt(s, 5) for s in head]
-
-        gen_model = AutoModelForCausalLM.from_pretrained(
-            args.model_name, trust_remote_code=args.trust_remote_code,
-            torch_dtype=(torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else
-                         (torch.float16 if torch.cuda.is_available() else torch.float32)),
-            device_map="auto"
-        )
-
-        def _simple_generate(prompts: List[str], cfg: GenCfg):
-            dev = next(gen_model.parameters()).device
-            enc = gen_tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=1024)
-            enc = {k:v.to(dev) for k,v in enc.items()}
-            pad_id = gen_tokenizer.pad_token_id or gen_tokenizer.eos_token_id
-            eos_id = gen_tokenizer.eos_token_id
-            out = gen_model.generate(**enc, do_sample=True, top_p=cfg.top_p, top_k=cfg.top_k,
-                                     temperature=cfg.temperature, repetition_penalty=cfg.repetition_penalty,
-                                     min_new_tokens=cfg.min_new_tokens, max_new_tokens=cfg.max_new_tokens,
-                                     pad_token_id=pad_id, eos_token_id=eos_id)
-            new_tokens = out[:, enc["input_ids"].shape[1]:]
-            return gen_tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
-
-        resp_obs = _simple_generate(obs_prompts, cfg_obs)
-        obs_jsons = [try_parse_json(t) for t in resp_obs]
-        obs_valid = [x if (x and validate_schema(x)) else None for x in obs_jsons]
-
-        hints = [build_bridge_hints(s, v, 3) for s, v in zip(head, obs_valid)]
-        pio_prompts=[]
-        for s, idea, hs in zip(head, obs_valid, hints):
-            rag_block = build_ctx_block(s.__dict__, 5)
-            pio_prompts.append(PIONEER_REFINE_JSON_PROMPT.format(
-                bridge_hints="; ".join(hs) if hs else "", idea_json=json.dumps(idea or {}, ensure_ascii=False),
-                rag_block=rag_block
-            ))
-        resp_pio = _simple_generate(pio_prompts, cfg_pio)
-
-        def _mktexts(seeds, parseds, raws):
-            xs=[]
-            for s, p, r in zip(seeds, parseds, raws):
-                t = make_irm_text_from_idea_relaxed(p) if p else fallback_irm_text_from_raw_response(r, s.problem)
-                xs.append(t)
-            return xs
-
-        obs_texts = _mktexts(head, obs_jsons, resp_obs)
-        pio_texts = _mktexts(head, [try_parse_json(t) for t in resp_pio], resp_pio)
-        r1, n1, p1 = irm_reward.score(obs_texts)
-        r2, n2, p2 = irm_reward.score(pio_texts)
-        allr = torch.cat([r1, r2], 0)
-        print(f"[NO-PPO] IRM raw mean={allr.mean().item():.4f}, std={allr.std().item():.4f}")
-
-        os.makedirs("./outputs/crea_bridge_last", exist_ok=True)
-        with open("./outputs/crea_bridge_last/samples_no_ppo.jsonl","w",encoding="utf-8") as f:
-            for o,p in zip(resp_obs, resp_pio):
-                f.write(json.dumps({"observer": o, "pioneer": p}, ensure_ascii=False)+"\n")
-        print("Saved: ./outputs/crea_bridge_last/samples_no_ppo.jsonl")
-        return
-
-    # === PPO mode ===
-    print(f"[DEBUG] _HAS_TRL={_HAS_TRL}, _HAS_PEFT={_HAS_PEFT}, _HAS_DS={_HAS_DS}")
-    print(f"[DEBUG] seeds_path exists: {os.path.isfile(args.seeds_path)}")
-
-    reward_hist=[]
-    def moving_avg(xs, k=20):
-        out=[]; s=0.0; q=[]
-        for x in xs:
-            q.append(x); s+=x
-            if len(q)>k: s-=q.pop(0)
-            out.append(s/len(q))
-        return out
-
-    get_batch = batch_iterator(seeds, args.batch_size)
-    for step in tqdm(range(args.total_steps), desc="train"):
-        batch = next(get_batch)
-
-        # Observer
-        obs_prompts = [build_observer_prompt(s, 5) for s in batch]
-        resp_obs = generate_texts_with_trl(ppo_trainer, obs_prompts, cfg_obs)
-        obs_jsons = [try_parse_json(t) for t in resp_obs]
-        obs_valid = [x if (x and validate_schema(x)) else None for x in obs_jsons]
-
-        # Bridger -> Pioneer
-        bridge_hints_batch = [build_bridge_hints(s, idea, 3) for s, idea in zip(batch, obs_valid)]
-        pio_prompts=[]
-        for s, idea, hints in zip(batch, obs_valid, bridge_hints_batch):
-            rag_block = build_ctx_block(s.__dict__, 5)
-            pio_prompts.append(PIONEER_REFINE_JSON_PROMPT.format(
-                bridge_hints="; ".join(hints) if hints else "",
-                idea_json=json.dumps(idea or {}, ensure_ascii=False),
-                rag_block=rag_block
-            ))
-        resp_pio = generate_texts_with_trl(ppo_trainer, pio_prompts, cfg_pio)
-
-        # IRM scores
-        def _mktexts(seeds, parseds, raws):
-            xs=[]
-            for s, p, r in zip(seeds, parseds, raws):
-                t = make_irm_text_from_idea_relaxed(p) if p else fallback_irm_text_from_raw_response(r, s.problem)
-                xs.append(t)
-            return xs
-        obs_texts = _mktexts(batch, obs_jsons, resp_obs)
-        pio_texts = _mktexts(batch, [try_parse_json(t) for t in resp_pio], resp_pio)
-        raw_obs_t, n01_obs_t, prob_obs_t = irm_reward.score(obs_texts)
-        raw_pio_t, n01_pio_t, prob_pio_t = irm_reward.score(pio_texts)
-
-        # PPO steps (observer + periodically pioneer)
-        def _ppo_step(prompts, responses):
-            for attempt in range(2):
-                try:
-                    return ppo_trainer.step(prompts=prompts, responses=responses)
-                except TypeError:
-                    try:
-                        return ppo_trainer.step(prompts, responses)
-                    except Exception:
-                        if attempt==1: return {}
-                except Exception:
-                    return {}
-            return {}
-
-        _ = _ppo_step(obs_prompts, resp_obs)
-        if (step % max(1, args.swap_every)) == 0:
-            _ = _ppo_step(pio_prompts, resp_pio)
-
-        # logging
-        raw_all = torch.cat([raw_obs_t, raw_pio_t], 0)
-        n01_all = torch.cat([n01_obs_t, n01_pio_t], 0)
-        prob_all = (torch.cat([prob_obs_t, prob_pio_t], 0) if (prob_obs_t is not None and prob_pio_t is not None) else None)
-        scaled_all = torch.stack(build_reward_scaler(args.reward_scale_mode, args.reward_scale_beta)(raw_all, n01_all, prob_all))
-        reward_hist.append(float(scaled_all.mean().item()))
-        smooth = moving_avg(reward_hist, 20)[-1]
-
-        if _HAS_WANDB and (not args.disable_wandb):
+def load_prompts_from_jsonl(path: str, max_items: Optional[int]) -> List[str]:
+    prompts: List[str] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            if max_items is not None and i >= max_items:
+                break
             try:
-                wandb.log({
-                    "env/reward_raw_mean": float(raw_all.mean().item()),
-                    "env/reward_raw_std": float(raw_all.std().item()),
-                    "env/reward_mean_scaled": float(scaled_all.mean().item()),
-                    "env/reward_std_scaled": float(scaled_all.std().item()),
-                    "env/reward_smooth_scaled": smooth,
-                    "trainer/step": step,
-                    "env/irm_sliding": float(1.0 if args.irm_use_sliding else 0.0),
-                    "env/irm_stride_ratio": float(args.irm_stride_ratio),
-                })
-            except Exception as e:
-                print(f"[WARN] wandb.log failed: {e}")
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    if "prompt" in obj:
+                        prompts.append(str(obj["prompt"]))
+                    elif "task" in obj:
+                        prompts.append(str(obj["task"]))
+                    else:
+                        topic = obj.get("topic")
+                        problem = obj.get("problem")
+                        ctx = obj.get("context")
+                        if topic or problem or ctx:
+                            task = (problem or topic or "")
+                            if ctx and isinstance(ctx, list):
+                                try:
+                                    cites = "; ".join([c.get("title", "") for c in ctx[:3]])
+                                    # "ontext:" バグ修正済み
+                                    task = f"{task} Context: {cites}"
+                                except Exception:
+                                    pass
+                            prompts.append(task if task else str(obj))
+                        else:
+                            prompts.append(str(obj))
+                else:
+                    prompts.append(str(obj))
+            except Exception:
+                s = line.strip()
+                if s:
+                    prompts.append(s)
+    return prompts
 
-    print(">> Training finished.")
-    out_dir = "./outputs/crea_bridge_last"
-    os.makedirs(out_dir, exist_ok=True)
+
+# -----------------------------------------
+# プロンプト（JSONスキーマの{}はエスケープ済み）
+# -----------------------------------------
+BRIDGER_PROMPT = (
+    "You are BRIDGER. Given a TASK, output 3-7 short 'bisociative' key ideas that can spark novel directions.\n"
+    "Return JSON with schema: {{\"keys\": [\"...\", ...]}}\n"
+    "TASK:\n{task}\n"
+)
+
+PIONEER_PROMPT = (
+    "You are PIONEER. Read TASK and BRIDGER keys, then propose 1-3 concrete ideas.\n"
+    "Return JSON with schema: {{\"ideas\":[{{\"title\":\"...\",\"desc\":\"...\"}}],\"rationale\":\"...\"}}\n"
+    "TASK:\n{task}\n\nBRIDGER_KEYS: {keys}\n"
+)
+
+OBSERVER_PROMPT = (
+    "You are OBSERVER. Improve the PIONEER ideas for clarity, originality, and feasibility.\n"
+    "Return JSON with the same schema as PIONEER output (ideas array + rationale).\n"
+    "TASK:\n{task}\n\nPIONEER_JSON: {pioneer_json}\n"
+)
+
+
+# -----------------------------------------
+# 生成ヘルパ
+# -----------------------------------------
+@dataclass
+class GenCfg:
+    max_new_tokens: int = 128
+    temperature: float = 0.2
+    top_p: float = 0.9
+    top_k: int = 0  # top_p専用運用（JSON崩れ軽減を狙う）
+
+def safe_json_parse(txt: str, fallback: Any) -> Any:
     try:
-        ppo_trainer.save_pretrained(out_dir)
-        gen_tokenizer.save_pretrained(out_dir)
+        return json.loads(txt)
+    except Exception:
+        return fallback
+
+def run_generate(model, tokenizer, prompt: str, gen_cfg: GenCfg) -> str:
+    enc = tokenizer(prompt, return_tensors="pt")
+    dev = get_model_device(model)
+    enc = {k: v.to(dev) for k, v in enc.items()}
+    with torch.no_grad():
+        out = model.generate(
+            **enc,
+            do_sample=(gen_cfg.temperature > 0),
+            temperature=gen_cfg.temperature,
+            top_p=gen_cfg.top_p,
+            top_k=gen_cfg.top_k,
+            max_new_tokens=gen_cfg.max_new_tokens,
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+    text = tokenizer.decode(out[0], skip_special_tokens=True)
+    if text.startswith(prompt):
+        text = text[len(prompt):]
+    return text.strip()
+
+
+# -----------------------------------------
+# IRM: 科学系の採点器（回帰/分類どちらでもOK）
+# -----------------------------------------
+class IRMScorer:
+    def __init__(self, model_dir: str, max_len: int = 512, device: Optional[str] = None):
+        assert _HAS_IRM, "Transformers not available for IRM."
+        self.device = device or "cpu"  # 既定CPU（VRAM節約）
+        if self.device == "cuda" and not torch.cuda.is_available():
+            self.device = "cpu"
+        self.tok = AutoTokenizer.from_pretrained(model_dir)
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_dir).to(self.device)
+        self.max_len = max_len
+        self.model.eval()
+
+    @torch.no_grad()
+    def score_text(self, title: str, desc: str) -> float:
+        text = f"Title: {title}\nAbstract: {desc}"
+        enc = self.tok(text, truncation=True, max_length=self.max_len, return_tensors="pt").to(self.device)
+        out = self.model(**enc)
+        logits = out.logits.squeeze(0)
+        # 回帰: shape=[1], 分類: shape=[C]
+        if logits.ndim == 0 or logits.numel() == 1:
+            val = float(logits.item())
+            return 1.0 / (1.0 + math.exp(-val))  # 簡易シグモイド正規化
+        else:
+            prob = torch.softmax(logits, dim=-1)
+            return float(prob.max().item())
+
+
+# -----------------------------------------
+# モデル/トークナイザ/LoRA 準備
+# -----------------------------------------
+@dataclass
+class ModelBundle:
+    model: Any
+    tokenizer: Any
+
+def load_policy_model(model_name: str) -> ModelBundle:
+    tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+
+    cfg = AutoConfig.from_pretrained(model_name)
+    if _HAS_VHEAD:
+        base = AutoModelForCausalLMWithValueHead.from_pretrained(
+            model_name,
+            torch_dtype=(torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16),
+            device_map=device_map_auto(),
+        )
+        model = base
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            config=cfg,
+            torch_dtype=(torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16),
+            device_map=device_map_auto(),
+        )
+    try:
+        model.config.use_cache = False
     except Exception:
         pass
-    print(f"Saved model to: {out_dir}")
+    return ModelBundle(model=model, tokenizer=tok)
+
+def apply_lora_inplace(bundle: ModelBundle, r: int, alpha: int, dropout: float):
+    if not _HAS_PEFT or r is None or r <= 0:
+        return
+    target_modules = [
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+    ]
+    lcfg = LoraConfig(
+        r=r, lora_alpha=alpha, lora_dropout=dropout,
+        bias="none", task_type="CAUSAL_LM", target_modules=target_modules,
+    )
+    policy = bundle.model
+    base = getattr(policy, "pretrained_model", policy)
+    for p in base.parameters():
+        p.requires_grad = False
+    peft_base = get_peft_model(base, lcfg)
+    if hasattr(policy, "pretrained_model"):
+        policy.pretrained_model = peft_base
+        bundle.model = policy
+    else:
+        bundle.model = peft_base
+
+
+def build_ppo_trainer_ref_free(bundle: ModelBundle, prompts: List[str],
+                               lr: float, batch_size: int, mini_batch_size: int, ppo_epochs: int):
+    if not _HAS_TRL:
+        raise RuntimeError("TRL (PPOTrainer) がインストールされていないため、PPOを開始できません。")
+    class DummyCollator:
+        def __call__(self, batch):
+            return batch
+    dataset = PromptDataset(prompts)
+    try:
+        from trl import PPOConfig
+        ppo_cfg = PPOConfig(
+            learning_rate=lr,
+            batch_size=batch_size,
+            mini_batch_size=mini_batch_size,
+            ppo_epochs=ppo_epochs,
+            seed=42,
+        )
+        if hasattr(ppo_cfg, "use_reference_model"):
+            setattr(ppo_cfg, "use_reference_model", False)
+    except Exception:
+        ppo_cfg = SimpleNamespace(
+            learning_rate=lr,
+            batch_size=batch_size,
+            mini_batch_size=mini_batch_size,
+            seed=42,
+            ppo_epochs=ppo_epochs,
+            epochs=ppo_epochs,
+            use_reference_model=False,
+            target_kl=0.05,
+            adap_kl_ctrl=True,
+        )
+    last_err = None
+    for attempt in range(3):
+        try:
+            if attempt == 0:
+                trainer = PPOTrainer(config=ppo_cfg, model=bundle.model, ref_model=None,
+                                     tokenizer=bundle.tokenizer, dataset=dataset, data_collator=DummyCollator())
+            elif attempt == 1:
+                trainer = PPOTrainer(ppo_cfg, bundle.model, None, bundle.tokenizer, dataset, DummyCollator())
+            else:
+                trainer = PPOTrainer(model=bundle.model, tokenizer=bundle.tokenizer, dataset=dataset,
+                                     data_collator=DummyCollator(), config=ppo_cfg)
+            if getattr(trainer, "ref_model", None) is not None:
+                print("[WARN] ref_model detected; removing to save VRAM.")
+                trainer.ref_model = None
+            return trainer
+        except Exception as e:
+            last_err = e
+            print(f"[DEBUG] PPO init attempt {attempt} failed (ref-free): {type(e).__name__}: {e}")
+    raise RuntimeError(f"PPOトレーナの初期化に失敗しました: {last_err}")
+
+
+# -----------------------------------------
+# 3段生成パイプライン（堅牢パース）
+# -----------------------------------------
+def run_pipeline_three_agents(bundle: ModelBundle, task: str, gen_cfg: GenCfg) -> Dict[str, Any]:
+    # 1) Bridger
+    bridger_prompt = BRIDGER_PROMPT.format(task=task) + "Output ONLY valid minified JSON."
+    bridger_out = run_generate(bundle.model, bundle.tokenizer, bridger_prompt, gen_cfg)
+    bridger_json = extract_first_json(bridger_out) or {"keys": []}
+    if not isinstance(bridger_json, dict):
+        bridger_json = {"keys": []}
+    if not bridger_json.get("keys"):
+        rough = [w for w in str(task).replace("/", " ").replace(",", " ").split() if len(w) > 3]
+        bridger_json["keys"] = list(dict.fromkeys(rough[:3])) or ["LLM", "Application", "bisociation"]
+
+    # 2) Pioneer
+    pioneer_prompt = PIONEER_PROMPT.format(task=task, keys=json.dumps(bridger_json.get("keys", []), ensure_ascii=False)) + "Output ONLY valid minified JSON."
+    pioneer_out = run_generate(bundle.model, bundle.tokenizer, pioneer_prompt, gen_cfg)
+    pioneer_json = extract_first_json(pioneer_out) or {"ideas": [], "rationale": ""}
+    if not isinstance(pioneer_json, dict):
+        pioneer_json = {"ideas": [], "rationale": ""}
+    pioneer_json.setdefault("ideas", [])
+    pioneer_json.setdefault("rationale", "")
+
+    # 3) Observer
+    observer_prompt = OBSERVER_PROMPT.format(task=task, pioneer_json=json.dumps(pioneer_json, ensure_ascii=False)) + "Output ONLY valid minified JSON."
+    observer_out = run_generate(bundle.model, bundle.tokenizer, observer_prompt, gen_cfg)
+    observer_json = extract_first_json(observer_out) or {"ideas": [], "rationale": ""}
+    if not isinstance(observer_json, dict):
+        observer_json = {"ideas": [], "rationale": ""}
+    observer_json.setdefault("ideas", [])
+    observer_json.setdefault("rationale", "")
+
+    return {
+        "bridger_raw": bridger_out,
+        "bridger": bridger_json,
+        "pioneer_raw": pioneer_out,
+        "pioneer": pioneer_json,
+        "observer_raw": observer_out,
+        "observer": observer_json,
+    }
+
+
+# -----------------------------------------
+# メイン
+# -----------------------------------------
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model-name", type=str, required=True)
+
+    # IRM
+    parser.add_argument("--irm-model-dir", type=str, required=True)
+    parser.add_argument("--irm-calib-path", type=str, default=None)  # ここでは未使用（将来の校正用）
+    parser.add_argument("--irm-max-len", type=int, default=512)
+    parser.add_argument("--irm-use-sliding", action="store_true")
+    parser.add_argument("--irm-stride-ratio", type=float, default=0.75)
+    parser.add_argument("--irm-agg", type=str, default="median")
+    parser.add_argument("--irm-device", type=str, default="cpu", choices=["cpu", "cuda"], help="IRM推論デバイス（既定: cpu）")
+
+    # Seeds / 学習
+    parser.add_argument("--seeds-path", type=str, required=True)
+    parser.add_argument("--max-seeds", type=int, default=None)
+
+    parser.add_argument("--total-steps", type=int, default=200)
+    parser.add_argument("--ppo-epochs", type=int, default=1)  # 表示用（実ループはtotal_steps基準）
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--mini-batch-size", type=int, default=1)
+    parser.add_argument("--learning-rate", type=float, default=5e-6)
+
+    # 生成
+    parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--top-p", type=float, default=0.9)
+    parser.add_argument("--top-k", type=int, default=0)
+
+    # LoRA
+    parser.add_argument("--lora-r", type=int, default=0)
+    parser.add_argument("--lora-alpha", type=int, default=16)
+    parser.add_argument("--lora-dropout", type=float, default=0.05)
+
+    # Logging
+    parser.add_argument("--log-every-n", type=int, default=20, help="W&Bへ生出力を載せる間隔（ステップ）")
+
+    args = parser.parse_args()
+
+    set_default_dtype_bf16_if_available()
+
+    # モデル
+    bundle = load_policy_model(args.model_name)
+    apply_lora_inplace(bundle, args.lora_r, args.lora_alpha, args.lora_dropout)
+
+    # 上の行で誤変換が出た場合に備えて通常の代入を再度実施
+    apply_lora_inplace(bundle, args.lora_r, args.lora_alpha, args.lora_dropout)
+
+    # IRM（★既定CPU）
+    irm = IRMScorer(args.irm_model_dir, max_len=args.irm_max_len, device=args.irm_device)
+
+    # データ
+    prompts = load_prompts_from_jsonl(args.seeds_path, args.max_seeds)
+    if len(prompts) == 0:
+        raise RuntimeError("seedsが空です。--seeds-path を確認してください。")
+
+    # PPO 構築（失敗時は例外で終了）
+    trainer = build_ppo_trainer_ref_free(
+        bundle=bundle,
+        prompts=prompts,
+        lr=args.learning_rate,
+        batch_size=args.batch_size,
+        mini_batch_size=args.mini_batch_size,
+        ppo_epochs=args.ppo_epochs,
+    )
+
+    gen_cfg = GenCfg(
+        max_new_tokens=args.max_new_tokens,
+        temperature=max(0.0, min(args.temperature, 1.0)),
+        top_p=args.top_p,
+        top_k=args.top_k,
+    )
+
+    # W&B
+    if _HAS_WANDB:
+        wandb.init(project="CREA-Bridge", config=vars(args))
+    else:
+        print("[WARN] wandb が見つかりません。pip install wandb で有効化できます。")
+
+    # ===== PPO学習ループ（total_steps 回必ず回す） =====
+    print("[INFO] PPO training start (reference-free, LoRA-only).")
+    total_updates = args.total_steps
+    pbar = trange(total_updates, desc="PPO Updates", unit="upd", dynamic_ncols=True) if _HAS_TQDM else None
+
+    ema = EMA(beta=0.9)
+    reward_sum = 0.0
+    n_reward = 0
+
+    for upd in range(total_updates):
+        task = prompts[upd % len(prompts)]  # シードを循環
+        t0 = time.time()
+
+        # 3段生成
+        out = run_pipeline_three_agents(bundle, task=task, gen_cfg=gen_cfg)
+        obs_ideas = out.get("observer", {}).get("ideas", [])
+
+        # ---- 報酬の対象テキストを必ず作る（JSON壊れていても評価） ----
+        if obs_ideas:
+            choice = obs_ideas[0]
+            title = (choice.get("title") or "Untitled")[:200]
+            desc  = (choice.get("desc") or "")[:4000]
+            trainable_text = f"{title}\n{desc}"
+        else:
+            raw = out.get("observer_raw") or out.get("pioneer_raw") or out.get("bridger_raw") or ""
+            lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+            title = (lines[0] if lines else "Untitled")[:100]
+            desc  = raw[:1000]
+            trainable_text = f"{title}\n{desc}"
+
+        # ---- PPO一歩 + 報酬計算 ----
+        try:
+            tokens = bundle.tokenizer(trainable_text, return_tensors="pt", truncation=True, max_length=gen_cfg.max_new_tokens)
+            dev = get_model_device(bundle.model)
+            query_tensors = tokens["input_ids"].to(dev)
+            response_tensors = query_tensors  # 最小構成（ref-free）
+            rew = irm.score_text(title, desc)  # ★毎ステップ必ずスカラー
+            rewards = torch.tensor([rew], dtype=torch.float32, device=query_tensors.device)
+            trainer.step([query_tensors], [response_tensors], rewards)
+            reward_sum += float(rew)
+            n_reward += 1
+        except Exception as e:
+            print(f"[DEBUG] PPO step skipped at upd {upd+1}: {e}")
+            rew = float("nan")
+
+        # ---- メトリクス（毎ステップ） ----
+        step_time = time.time() - t0
+        ema_val = ema.update(rew if (rew == rew) else float("nan"))
+        avg_val = (reward_sum / n_reward) if n_reward > 0 else float("nan")
+
+        if _HAS_WANDB:
+            wandb.log({
+                "step": upd + 1,
+                "reward": float(rew) if (rew == rew) else float("nan"),
+                "reward/ema": float(ema_val) if (ema_val == ema_val) else float("nan"),
+                "reward/avg": float(avg_val) if (avg_val == avg_val) else float("nan"),
+                "time/step_sec": step_time,
+            }, step=upd + 1)
+
+            # ---- サンプルの生出力（log-every-n ごと） ----
+            if upd % max(1, args.log_every_n) == 0:
+                try:
+                    table = wandb.Table(columns=["step", "task", "bridger", "pioneer", "observer"])
+                    table.add_data(
+                        upd + 1,
+                        str(task)[:2000],
+                        out.get("bridger_raw", "")[:4000],
+                        out.get("pioneer_raw", "")[:4000],
+                        out.get("observer_raw", "")[:4000],
+                    )
+                    wandb.log({"samples/outputs": table}, step=upd + 1)
+                except Exception as e:
+                    print(f"[DEBUG] wandb table log failed at upd {upd+1}: {e}")
+
+        if pbar:
+            pbar.update(1)
+            pbar.set_postfix({
+                "epoch": f"1/{max(1, args.ppo_epochs)}",
+                "reward": f"{rew:.3f}" if (rew == rew) else "NaN"
+            })
+
+    if pbar:
+        pbar.close()
+    print("[INFO] PPO training done.")
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"[FATAL] {type(e).__name__}: {e}")
+        sys.exit(1)

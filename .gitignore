@@ -24,3 +24,10 @@ wandb/
 # OS依存ファイル
 .DS_Store
 Thumbs.db
+
+*.arrow
+*.bin
+*.safetensors
+*.Python
+*.pth
+*.pt

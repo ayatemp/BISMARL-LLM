@@ -1,129 +1,131 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-CREA-Bridge: CORY + Bridger + IRM + PPO (single-file runner)
-- 既存の cory_withIRM_rag.py【構造・関数名は極力互換】をベースに、Bridger エージェントを追加
-- Bridger は Observer の初期案と RAG 文脈を読み、遠距離概念（bisociation）を提案し、
-  Pioneer の入力 JSON に追加ヒント（BRIDGE_HINTS）として注入する
-- IRM で Observer/Pioneer の両方をスコアリングし、PPO で更新
+CREA-Bridge (single-file, simple & robust)
+- Pipeline: Observer(JSON) -> Pioneer(JSON) with small Bridger hints
+- Reward: IRM regression head (optionally sliding-window + calibration) -> scaled (zscore→tanh or calibrated prob)
+- Training: TRL PPOTrainer if available; else fall back to NO-PPO (generate+score)
+- Orchestration: Accelerate; Deepspeed via Accelerate if --use-deepspeed is passed
+- Logging: wandb (disable with --disable-wandb)
 
-実行例:
-python cory_crea_bridge.py \
-  --model_name gpt2 \
-  --irm_model_dir ./IRM/irm_iclr_model \
-  --seeds_path ./data/research_seeds.jsonl \
-  --total_steps 1000
-
-依存:
-  - trainer_builder.py （同ディレクトリに置く）【17†source】
-  - 研究シード research_seeds.jsonl （search_to_seeds.py で作成）【16†source】
-  - IRM 学習済み分類器（AutoModelForSequenceClassification, 1..10 予測）【15†source】
+Notes:
+- Keep dependencies modest; fail-safe fallbacks with explicit debug prints
+- HF datasets required for PPO dataset stability
 """
 
 from __future__ import annotations
-
-import os
-import re
-import json
-import time
-import math
-import random
-import pathlib
+import os, re, json, time, random, argparse, sys, traceback
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-# tqdm の安全 import（notebook/CLI 双方で落ちない）
+import numpy as np
+import torch
+
+# tqdm (optional)
 try:
     from tqdm.auto import tqdm
-except ImportError:
-    def tqdm(it=None, **kw):
-        return it if it is not None else range(kw.get("total", 0))
+except Exception:
+    def tqdm(it, **kw): return it
 
-import torch
-import tyro
-import wandb
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+# wandb (enabled by default; can be disabled via --disable-wandb)
+try:
+    import wandb
+    _HAS_WANDB = True
+except Exception:
+    _HAS_WANDB = False
+    class _W:  # dummy
+        def init(self, **k): pass
+        def log(self, d): pass
+    wandb = _W()
+
+# Deepspeed (optional; used via Accelerate)
+try:
+    import deepspeed  # noqa: F401
+    _HAS_DS = True
+except Exception:
+    _HAS_DS = False
+
+# Transformers
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    AutoModelForCausalLM,
+)
 from transformers.utils import is_bitsandbytes_available
 try:
     from transformers import BitsAndBytesConfig
 except Exception:
     BitsAndBytesConfig = None
 
-# ================================================================
-# 既存 cory_withIRM_rag.py のユーティリティを踏襲（必要最小限を同梱）
-# 参照: REQUIRED_KEYS / JSON整形 / IRMReward / EMAStats 等は互換
-# ================================================================
-REQUIRED_KEYS = [
-    "input_concepts", "new_concepts", "bridge_rationale",
-    "plan", "risks", "title", "abstract"
-]
+# TRL (optional)
+_HAS_TRL = True
+try:
+    from trl import PPOConfig, PPOTrainer, AutoModelForCausalLMWithValueHead
+except Exception:
+    _HAS_TRL = False
 
+# datasets (required for PPO dataset)
+from datasets import Dataset as HFDataset
+
+# peft (optional for LoRA)
+try:
+    from peft import LoraConfig, get_peft_model
+    _HAS_PEFT = True
+except Exception:
+    _HAS_PEFT = False
+
+# ================================================================
+# JSON utils (robust but minimal)
+# ================================================================
+REQUIRED_KEYS = ["input_concepts","new_concepts","bridge_rationale","plan","risks","title","abstract"]
 _JSON_TITLE_RE = re.compile(r'"title"\s*:\s*"([^"]+)"', re.S)
 _JSON_ABS_RE   = re.compile(r'"abstract"\s*:\s*"([^"]+)"', re.S)
 
-
 def _strip_nonjson_tail(s: str) -> str:
-    if not s:
-        return s
-    i = s.find('{'); j = s.rfind('}')
-    if i != -1 and j != -1 and j > i:
-        return s[i:j+1]
-    return s
-
+    if not s: return s
+    i, j = s.find('{'), s.rfind('}')
+    return s[i:j+1] if (i != -1 and j != -1 and j > i) else s
 
 def try_parse_json(s: str) -> Optional[Dict[str, Any]]:
-    if not s:
-        return None
-    s1 = _strip_nonjson_tail(s).replace("\r", "")
+    if not s: return None
+    s1 = _strip_nonjson_tail(s).replace("\r","")
     s1 = re.sub(r',\s*([}\]])', r'\1', s1)
     try:
         return json.loads(s1)
     except Exception:
         return None
 
-
 def validate_schema(obj: Dict[str, Any]) -> bool:
-    if not isinstance(obj, dict):
-        return False
+    if not isinstance(obj, dict): return False
     for k in REQUIRED_KEYS:
-        if k not in obj:
-            return False
+        if k not in obj: return False
         v = obj[k]
-        if isinstance(v, str) and len(v.strip()) < 5:
-            return False
-        if isinstance(v, list) and len(v) == 0:
-            return False
+        if isinstance(v, str) and len(v.strip()) < 5: return False
+        if isinstance(v, list) and len(v) == 0: return False
     ic = obj.get("input_concepts", []); nc = obj.get("new_concepts", [])
     if isinstance(ic, list) and isinstance(nc, list):
-        if set(map(str.lower, ic)) == set(map(str.lower, nc)):
-            return False
+        if set(map(str.lower, ic)) == set(map(str.lower, nc)): return False
     return True
 
-
 def make_irm_text_from_idea_relaxed(idea: Dict[str, Any]) -> str:
-    if not isinstance(idea, dict):
-        return ""
-    t = str(idea.get("title", "") or "").strip()
-    a = str(idea.get("abstract", "") or "").strip()
-    b = str(idea.get("bridge_rationale", "") or "").strip()
-    p = str(idea.get("plan", "") or "").strip()
-    if not (t or a or b or p):
-        return ""
+    if not isinstance(idea, dict): return ""
+    t = str(idea.get("title","")).strip()
+    a = str(idea.get("abstract","")).strip()
+    b = str(idea.get("bridge_rationale","")).strip()
+    p = str(idea.get("plan","")).strip()
     parts = []
     if t: parts.append(t)
     if a: parts.append(a)
     if b: parts.append(f"Bridge: {b}")
     if p: parts.append(f"Plan: {p}")
-    return "\n\n".join(parts)
-
+    return "\n\n".join(parts) if parts else ""
 
 def fallback_irm_text_from_raw_response(resp_text: str, seed_problem: str = "") -> str:
     if not resp_text:
         head = seed_problem.strip() or "Generated Idea"
         return f"{head}\n\nEmpty response."
     s = _strip_nonjson_tail(resp_text)
-    mt = _JSON_TITLE_RE.search(s)
-    ma = _JSON_ABS_RE.search(s)
+    mt, ma = _JSON_TITLE_RE.search(s), _JSON_ABS_RE.search(s)
     if mt or ma:
         t = mt.group(1).strip() if mt else ""
         a = ma.group(1).strip() if ma else s[:1000]
@@ -132,119 +134,142 @@ def fallback_irm_text_from_raw_response(resp_text: str, seed_problem: str = "") 
     head = seed_problem.strip() or "Generated Idea"
     return f"{head}\n\n{body}"
 
+# ================================================================
+# IRM reward (sliding window + optional calibration)
+# ================================================================
+def _build_piecewise_calibrator_from_buckets(buckets: List[dict]):
+    xs, ys = [], []
+    for b in buckets:
+        if "pred_mean" in b and "true_mean" in b:
+            xs.append(float(b["pred_mean"]))
+            ys.append(float(b["true_mean"]))
+    if len(xs) < 2:
+        return lambda v: float(np.clip(v, 0.0, 1.0))
+    xs, ys = np.array(xs), np.array(ys)
+    order = np.argsort(xs)
+    xs, ys = xs[order], np.maximum.accumulate(ys[order])
+    def f(v: float) -> float:
+        return float(np.interp(v, xs, ys, left=ys[0], right=ys[-1]))
+    return f
 
 class IRMReward:
-    def __init__(
-        self,
-        irm_model_dir: str,
-        max_length: int = 512,
-        device: torch.device | None = None,
-        quantization: str = "none",
-        torch_dtype: str | None = "auto",
-        device_map: str = "auto",
-        low_cpu_mem_usage: bool = True,
-        offload_folder: str | None = None,
-        max_memory: dict | None = None,
-    ):
+    def __init__(self, irm_model_dir: str, max_length: int = 512,
+                 device: Optional[torch.device] = None,
+                 quantization: str = "none", torch_dtype: str = "auto",
+                 use_sliding: bool = False, stride_ratio: float = 0.5, agg: str = "mean",
+                 calib_path: Optional[str] = None):
         self.max_length = max_length
-        self._uses_device_map = False
         self.device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
         self.tok = AutoTokenizer.from_pretrained(irm_model_dir, use_fast=True)
 
-        if torch_dtype == "float16":
-            _dtype = torch.float16
-        elif torch_dtype == "bfloat16":
-            _dtype = torch.bfloat16
-        elif torch_dtype == "float32":
-            _dtype = torch.float32
-        else:
-            _dtype = None
+        self.use_sliding = bool(use_sliding)
+        self.stride_ratio = float(max(0.01, min(0.99, stride_ratio)))
+        self.agg = (agg or "mean").lower().strip()
+        self.calib_fn = None
 
-        def _maybe_dtype(kw: dict):
-            if _dtype is not None and "torch_dtype" not in kw:
-                kw["torch_dtype"] = _dtype
-            return kw
+        # model load
+        dtype = None
+        if torch_dtype == "float16": dtype = torch.float16
+        elif torch_dtype == "bfloat16": dtype = torch.bfloat16
+        elif torch_dtype == "float32": dtype = torch.float32
 
-        if quantization in ("8bit", "4bit"):
-            if not is_bitsandbytes_available() or BitsAndBytesConfig is None:
-                raise ImportError("bitsandbytes が必要です。`pip install -U bitsandbytes` を実行してください。")
-            bnb_cfg = BitsAndBytesConfig(
-                load_in_8bit=(quantization == "8bit"),
-                load_in_4bit=(quantization == "4bit"),
-                llm_int8_threshold=6.0,
-                llm_int8_has_fp16_weight=False,
+        if quantization in ("8bit","4bit") and is_bitsandbytes_available() and BitsAndBytesConfig is not None:
+            m = AutoModelForSequenceClassification.from_pretrained(
+                irm_model_dir,
+                torch_dtype=(torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else
+                             (torch.float16 if torch.cuda.is_available() else torch.float32)),
+                low_cpu_mem_usage=True
             )
-            kw = {
-                "quantization_config": bnb_cfg,
-                "device_map": device_map or "auto",
-                "low_cpu_mem_usage": low_cpu_mem_usage,
-            }
-            if max_memory is not None:
-                kw["max_memory"] = max_memory
-            if offload_folder is not None:
-                kw["offload_folder"] = offload_folder
-            _maybe_dtype(kw)
-            self.model = AutoModelForSequenceClassification.from_pretrained(irm_model_dir, **kw)
-            self._uses_device_map = True
-            self.model.eval()
-            return
-
-        kw = {"low_cpu_mem_usage": low_cpu_mem_usage}
-        if max_memory is not None:
-            kw["max_memory"] = max_memory
-        _maybe_dtype(kw)
-        try:
-            m = AutoModelForSequenceClassification.from_pretrained(irm_model_dir, **kw)
             m.to(self.device).eval()
             self.model = m
-        except RuntimeError:
+        else:
+            kw = {}
+            if dtype is not None: kw["torch_dtype"] = dtype
             try:
-                import gc
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                m = AutoModelForSequenceClassification.from_pretrained(irm_model_dir, low_cpu_mem_usage=True, **kw)
+                m.to(self.device).eval()
+                self.model = m
+            except RuntimeError:
+                try:
+                    import gc; gc.collect()
+                    if torch.cuda.is_available(): torch.cuda.empty_cache()
+                except Exception: pass
+                cpu = torch.device("cpu")
+                m = AutoModelForSequenceClassification.from_pretrained(irm_model_dir, low_cpu_mem_usage=True, **kw)
+                m.to(cpu).eval()
+                self.model = m
+
+        if calib_path and os.path.isfile(calib_path):
+            try:
+                with open(calib_path, "r", encoding="utf-8") as f:
+                    js = json.load(f)
+                buckets = js.get("calibration_buckets_reward") or js.get("calibration_buckets")
+                if isinstance(buckets, list) and buckets:
+                    self.calib_fn = _build_piecewise_calibrator_from_buckets(buckets)
             except Exception:
-                pass
-            self.device = torch.device("cpu")
-            m = AutoModelForSequenceClassification.from_pretrained(irm_model_dir, **kw)
-            m.to(self.device).eval()
-            self.model = m
+                self.calib_fn = None
+
+    def _windows_of(self, text: str) -> List[str]:
+        ids = self.tok(text, add_special_tokens=False)["input_ids"]
+        L = len(ids)
+        if L <= self.max_length: return [text]
+        stride = max(1, int(self.max_length * (1.0 - self.stride_ratio)))
+        chunks = []
+        for start in range(0, L, stride):
+            end = start + self.max_length
+            sub_ids = ids[start:end]
+            if not sub_ids: continue
+            chunks.append(self.tok.decode(sub_ids, skip_special_tokens=True))
+            if end >= L: break
+        return chunks
 
     @torch.no_grad()
-    def score(self, idea_texts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
-        enc = self.tok(
-            idea_texts,
-            max_length=self.max_length,
-            truncation=True,
-            padding=True,
-            return_tensors="pt",
-        )
-        if not self._uses_device_map:
-            enc = {k: v.to(self.device) for k, v in enc.items()}
+    def _score_logits(self, texts: List[str]) -> torch.Tensor:
+        enc = self.tok(texts, max_length=self.max_length, truncation=True, padding=True, return_tensors="pt")
+        dev = next(self.model.parameters()).device
+        enc = {k:(v.to(dev) if torch.is_tensor(v) else v) for k,v in enc.items()}
         logits = self.model(**enc).logits.squeeze(-1).detach().float()
-        raw = logits
-        norm01 = torch.clamp((raw - 1.0) / 9.0, 0.0, 1.0)
-        return raw, norm01
+        return logits
 
-
-class EMAStats:
-    def __init__(self, decay: float = 0.99):
-        self.decay = decay; self._mean = None; self._var = None; self._eps = 1e-6
-    def update(self, x: torch.Tensor):
-        x = x.detach().float().mean()
-        if self._mean is None:
-            self._mean = x; self._var = torch.tensor(1.0, device=x.device)
+    @torch.no_grad()
+    def score(self, idea_texts: List[str]) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        if not self.use_sliding:
+            raw = self._score_logits(idea_texts)
         else:
-            self._mean = self.decay * self._mean + (1 - self.decay) * x
-            self._var = self.decay * self._var + (1 - self.decay) * (x - self._mean).pow(2)
-    @property
-    def mean(self): return float(self._mean.item() if self._mean is not None else 0.0)
-    @property
-    def std(self):  return float(torch.sqrt((self._var or torch.tensor(1.0)) + self._eps).item())
-
+            all_chunks, owners = [], []
+            for bi, t in enumerate(idea_texts):
+                for w in self._windows_of(t):
+                    all_chunks.append(w); owners.append(bi)
+            chunk_logits = self._score_logits(all_chunks)
+            B = len(idea_texts)
+            rows = [[] for _ in range(B)]
+            for logit, bi in zip(chunk_logits.tolist(), owners): rows[bi].append(logit)
+            # aggregate
+            import math as _m
+            maxW = max(len(r) for r in rows)
+            arr = torch.full((B, maxW), float("nan"))
+            for i, row in enumerate(rows): arr[i, :len(row)] = torch.tensor(row)
+            mask = ~torch.isnan(arr); arr2 = torch.where(mask, arr, torch.zeros_like(arr))
+            meanv = (arr2.sum(dim=1) / mask.sum(dim=1).clamp(min=1))
+            if self.agg == "median":
+                out = []
+                for i in range(B):
+                    xs = arr[i][mask[i]].tolist()
+                    out.append(float(np.median(xs) if xs else 0.0))
+                raw = torch.tensor(out)
+            elif self.agg == "max":
+                raw = torch.where(mask, arr2, torch.full_like(arr2, -1e9)).max(dim=1).values
+            else:
+                raw = meanv
+        norm01 = torch.clamp((raw - 1.0)/9.0, 0.0, 1.0)
+        prob = None
+        if self.calib_fn is not None:
+            p = [self.calib_fn(float(x)) for x in norm01.tolist()]
+            prob = torch.tensor(p, dtype=torch.float32, device=norm01.device)
+        return raw.float(), norm01.float(), (prob.float() if prob is not None else None)
 
 # ================================================================
-# RAG + プロンプト（既存の設計を踏襲）
+# RAG / prompts
 # ================================================================
 @dataclass
 class SeedItem:
@@ -254,7 +279,6 @@ class SeedItem:
     constraints: str = ""
     context: List[Dict[str, Any]] = None
     input_concepts: List[str] = None
-
 
 def load_seeds(path: str, limit: Optional[int] = None) -> List[SeedItem]:
     seeds: List[SeedItem] = []
@@ -269,32 +293,31 @@ def load_seeds(path: str, limit: Optional[int] = None) -> List[SeedItem]:
                 sources=obj.get("sources",[]) or [],
                 constraints=obj.get("constraints",""),
                 context=obj.get("context",[]) or [],
-                input_concepts=obj.get("input_concepts", []) or None,
+                input_concepts=obj.get("input_concepts",[]) or None,
             ))
-            if limit is not None and len(seeds) >= limit:
-                break
-    assert len(seeds) > 0, f"no seeds at {path}"
+            if limit is not None and len(seeds) >= limit: break
+    if not seeds: raise RuntimeError(f"no seeds at {path}")
     return seeds
 
-
-RAG_CONTEXT_TEMPLATE = """
----
-RAG_CONTEXT:
-{ctx}
-(Use the context only as background evidence. Do not copy; synthesize novel ideas.)
-"""
-
-
+RAG_CONTEXT_TEMPLATE = "\n---\nRAG_CONTEXT:\n{ctx}\n(Use the context only as background evidence. Do not copy; synthesize novel ideas.)\n"
 def build_ctx_block(seed: Dict[str, Any], max_docs: int = 5) -> str:
     ctx_lines = []
     for d in seed.get("context", [])[:max_docs]:
         title = (d.get("title") or "").strip()
         abstract = (d.get("abstract") or "").strip()
-        if not title and not abstract:
-            continue
+        if not title and not abstract: continue
         ctx_lines.append(f"- {title}\n  {abstract}")
     return RAG_CONTEXT_TEMPLATE.format(ctx="\n".join(ctx_lines)) if ctx_lines else ""
 
+SCHEMA_JSON = json.dumps({
+    "input_concepts": ["..."],
+    "new_concepts": ["..."],
+    "bridge_rationale": "...",
+    "plan": "...",
+    "risks": ["..."],
+    "title": "...",
+    "abstract": "..."
+}, ensure_ascii=False)
 
 OBSERVER_JSON_PROMPT = (
     "You are a creative research ideator.\n"
@@ -305,15 +328,11 @@ OBSERVER_JSON_PROMPT = (
     "SOURCES: {sources}\n"
     "CONSTRAINTS: {constraints}\n\n"
     "{input_hint}"
-    "Schema (keys required): {\"input_concepts\":[\"...\"], \"new_concepts\":[\"...\"], "
-    "\"bridge_rationale\":\"...\", \"plan\":\"...\", \"risks\":[\"...\"], "
-    "\"title\":\"...\", \"abstract\":\"...\"}\n\n"
+    "Schema (keys required): {schema}\n\n"
     "Requirements: encourage bisociation (combine distant concepts).\n"
     "Return JSON only. No prose outside JSON.\n\n"
     "{rag_block}"
 )
-
-
 PIONEER_REFINE_JSON_PROMPT = (
     "You are a research editor improving feasibility and clarity.\n"
     "Refine the JSON idea to reduce risks and increase feasibility, while preserving novelty.\n"
@@ -323,93 +342,40 @@ PIONEER_REFINE_JSON_PROMPT = (
     "{idea_json}\n\n{rag_block}"
 )
 
-
-def build_observer_prompt(seed: SeedItem, ctx_docs: int = 5) -> str:
-    rag_block = build_ctx_block(seed.__dict__, max_docs=ctx_docs)
-    ics = (seed.input_concepts or [])
-    input_hint = f"INPUT_CONCEPTS_HINT: {', '.join(ics)}\n" if ics else ""
-    return OBSERVER_JSON_PROMPT.format(
-        topic=seed.topic,
-        problem=seed.problem,
-        sources=", ".join(seed.sources),
-        constraints=seed.constraints or "",
-        input_hint=input_hint,
-        rag_block=rag_block,
-    )
-
-
-# ================================================================
-# CREA-Bridge: Bridger エージェント
-# ================================================================
-@dataclass
-class BridgerCfg:
-    max_hints: int = 3
-    prefer_new_fields: bool = True
-    allow_fallback_catalog: bool = True
-
-
-_BRIDGE_FALLBACK = [
-    # 交差領域カタログ（安全なデフォルト）
-    ("control theory", "text-to-policy distillation"),
-    ("graph signal processing", "causal discovery"),
-    ("program synthesis", "embodied evaluation"),
-    ("neurosymbolic reasoning", "toolformer planning"),
-    ("mechanistic interpretability", "active learning"),
-    ("edge robotics", "federated RL"),
-]
-
-
 def _extract_fields(seed: SeedItem) -> List[str]:
     found = []
     for d in seed.context or []:
         for f in d.get("fields", []) or []:
-            if f and f not in found:
-                found.append(f)
+            if f and f not in found: found.append(f)
     return found
-
 
 def _guess_input_concepts(seed: SeedItem, observer_json: Optional[Dict[str, Any]]) -> List[str]:
     if observer_json and isinstance(observer_json.get("input_concepts"), list):
         return [str(x).strip() for x in observer_json.get("input_concepts") if str(x).strip()]
     if seed.input_concepts:
         return [str(x).strip() for x in seed.input_concepts if str(x).strip()]
-    # topic から緩く抽出（カンマ/スラッシュ分割）
-    toks = re.split(r"[,/]|\band\b|\+|\|", seed.topic.lower())
+    toks = re.split(r"[,/]|\\band\\b|\\+|\\|", seed.topic.lower())
     toks = [t.strip() for t in toks if t.strip()]
     return toks[:4]
 
-
-def _pick_distant_fields(all_fields: List[str], used_concepts: List[str], k: int) -> List[str]:
-    # シンプル: seed.context の分野から未使用のものを優先、無ければランダム
-    pool = [f for f in all_fields if f and f.lower() not in {c.lower() for c in used_concepts}]
-    if not pool:
-        return random.sample(all_fields, min(k, len(all_fields))) if all_fields else []
-    random.shuffle(pool)
-    return pool[:k]
-
-
-def build_bridge_hints(seed: SeedItem, observer_json: Optional[Dict[str, Any]], cfg: BridgerCfg) -> List[str]:
+def build_bridge_hints(seed: SeedItem, observer_json: Optional[Dict[str, Any]], max_hints: int = 3) -> List[str]:
     fields = _extract_fields(seed)
-    base_concepts = _guess_input_concepts(seed, observer_json)
-
-    # 1) context にある別分野からピック
-    picks = _pick_distant_fields(fields, base_concepts, cfg.max_hints)
-    hints: List[str] = []
-    for f in picks:
-        hints.append(f"Leverage domain '{f}' to connect with input concepts {base_concepts}.")
-
-    # 2) 予備カタログ
-    if cfg.allow_fallback_catalog and len(hints) < cfg.max_hints:
-        remain = cfg.max_hints - len(hints)
-        cand = random.sample(_BRIDGE_FALLBACK, min(remain, len(_BRIDGE_FALLBACK)))
-        for a, b in cand:
-            hints.append(f"Cross with {a} and {b} to induce bisociation.")
-
-    return hints[: cfg.max_hints]
-
+    base = _guess_input_concepts(seed, observer_json)
+    pool = [f for f in fields if f and f.lower() not in {c.lower() for c in base}] or fields
+    random.shuffle(pool)
+    picks = pool[:max_hints]
+    hints = [f"Leverage domain '{f}' to connect with input concepts {base}." for f in picks]
+    fallback = [("control theory","text-to-policy distillation"),
+                ("graph signal processing","causal discovery"),
+                ("program synthesis","embodied evaluation"),
+                ("neurosymbolic reasoning","active learning")]
+    while len(hints) < max_hints and fallback:
+        a,b = fallback.pop(random.randrange(len(fallback)))
+        hints.append(f"Cross with {a} and {b} to induce bisociation.")
+    return hints[:max_hints]
 
 # ================================================================
-# 生成 / 報酬スケール / 設定
+# Generation + reward scaling
 # ================================================================
 @dataclass
 class GenCfg:
@@ -420,341 +386,470 @@ class GenCfg:
     top_k: int
     repetition_penalty: float
 
+class EMAStats:
+    def __init__(self, decay: float = 0.99):
+        self.decay=decay; self._mean=None; self._var=None; self._eps=1e-6
+    def update(self, x: torch.Tensor):
+        x = x.detach().float().mean()
+        if self._mean is None:
+            self._mean = x; self._var = torch.tensor(1.0, device=x.device)
+        else:
+            self._mean = self.decay*self._mean + (1-self.decay)*x
+            self._var  = self.decay*self._var  + (1-self.decay)*(x-self._mean).pow(2)
+    @property
+    def mean(self): return float(self._mean.item() if self._mean is not None else 0.0)
+    @property
+    def std(self):  return float(torch.sqrt((self._var or torch.tensor(1.0))+self._eps).item())
 
-@dataclass
-class TrainArgs:
-    model_name: str = "gpt2"
-    trust_remote_code: bool = False
+def build_reward_scaler(mode: str = "raw_zscore_tanh", beta: float = 1.5):
+    ema_raw = EMAStats(0.99); ema_prob = EMAStats(0.99)
+    def scale(raw: torch.Tensor, n01: torch.Tensor, prob: Optional[torch.Tensor]) -> List[torch.Tensor]:
+        m = (mode or "raw_zscore_tanh")
+        b = float(beta)
+        if m == "raw_identity":
+            r = raw.float()
+        elif m == "raw_zscore_tanh":
+            ema_raw.update(raw); z = (raw.float()-ema_raw.mean)/max(ema_raw.std,1e-6); r = torch.tanh(z*b)
+        elif m == "norm01_identity":
+            r = n01.float()
+        elif m == "norm01_zscore_tanh":
+            ema_raw.update(n01); z = (n01.float()-ema_raw.mean)/max(ema_raw.std,1e-6); r = torch.tanh(z*b)
+        elif m == "calibrated_prob" and prob is not None:
+            ema_prob.update(prob); z = (prob.float()-ema_prob.mean)/max(ema_prob.std,1e-6); r = torch.tanh(z*b)
+        else:
+            r = n01.float()
+        return [ri.detach() for ri in r]
+    return scale
+
+# ================================================================
+# PPO trainer helpers
+# ================================================================
+def _record_to_prompt(rec: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(rec, dict): return None
+    if "prompt" in rec and isinstance(rec["prompt"], str) and rec["prompt"].strip():
+        return rec["prompt"].strip()
+    topic = rec.get("topic"); problem = rec.get("problem"); constraints = rec.get("constraints"); sources = rec.get("sources"); ctx_list = rec.get("context")
+    if isinstance(sources, list): src_txt = ", ".join(map(str, sources))
+    elif isinstance(sources, str): src_txt = sources
+    else: src_txt = ""
+    ctx_lines = []
+    if isinstance(ctx_list, list):
+        for c in ctx_list[:5]:
+            if isinstance(c, dict):
+                t=c.get("title",""); a=c.get("abstract",""); fields=c.get("fields",[])
+                fields_str=", ".join(fields) if isinstance(fields,list) else str(fields)
+                ctx_lines.append(f"- {t} | fields: {fields_str} | abs: {a}")
+            else:
+                ctx_lines.append(f"- {str(c)}")
+    headline = problem or topic or "Creative research idea generation"
+    base = [f"Topic: {topic}" if topic else None,
+            f"Problem: {problem}" if problem else None,
+            f"Sources/Fields: {src_txt}" if src_txt else None,
+            f"Constraints: {constraints}" if constraints else None]
+    base = [b for b in base if b]
+    ctx_block = "Context papers:\n" + "\n".join(ctx_lines[:10]) if ctx_lines else ""
+    prompt = (f"{headline}\n" + ("\n".join(base)+"\n" if base else "") +
+              (ctx_block+"\n\n" if ctx_block else "") +
+              "Give me three concrete, novel, and feasible research ideas that bridge distant fields above. "
+              "Each idea must include: (1) title, (2) 2–3 sentence rationale, (3) minimal viable experiment with metrics, (4) risks+mitigations.")
+    return prompt
+
+def _load_prompts_from_jsonl(path: str, max_seeds: Optional[int]) -> List[str]:
+    prompts: List[str] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                p = _record_to_prompt(rec)
+                if p and p.strip():
+                    prompts.append(p.strip())
+            except json.JSONDecodeError:
+                if line.strip():
+                    prompts.append(line.strip())
+    random.shuffle(prompts)
+    if max_seeds and max_seeds > 0:
+        prompts = prompts[:max_seeds]
+
+    # ★ ここを強化：必ず十分な個数にする
+    base_prompt = "Give me three creative research ideas that connect LLMs × Reinforcement Learning."
+    if len(prompts) < 32:
+        need = 32 - len(prompts)
+        prompts.extend([base_prompt] * need)
+
+    return prompts
+
+def _build_hfdataset(prompts: List[str]):
+    return HFDataset.from_dict({"prompt": prompts})
+
+def _build_ppo_trainer(model, tokenizer, seeds_path: str, max_seeds: Optional[int],
+                       learning_rate: float, batch_size: int, mini_batch_size: int, ppo_epochs: int,
+                       lora_r: int, lora_alpha: int, lora_dropout: float):
+    if not _HAS_TRL:
+        print("[DEBUG] TRL not available.")
+        return None
+
+    prompts = _load_prompts_from_jsonl(seeds_path, max_seeds)
+    dataset = _build_hfdataset(prompts)
+
+    # Optional LoRA
+    if lora_r and lora_r>0 and _HAS_PEFT:
+        lora_cfg = LoraConfig(r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+                              bias="none", task_type="CAUSAL_LM",
+                              target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"])
+        policy = model.pretrained_model
+        policy = get_peft_model(policy, lora_cfg)
+        model.pretrained_model = policy
+        try: model.pretrained_model.config.use_cache = False
+        except Exception: pass
+
+    # PPO config
+    ppo_config = PPOConfig(learning_rate=learning_rate, batch_size=batch_size, mini_batch_size=mini_batch_size,seed=42)
+    if hasattr(ppo_config, "use_reference_model"): ppo_config.use_reference_model = False
+    if hasattr(ppo_config, "ppo_epochs"): ppo_config.ppo_epochs = ppo_epochs
+    elif hasattr(ppo_config, "epochs"): ppo_config.epochs = ppo_epochs
+
+    # Try multiple constructor signatures (robust to TRL API drift)
+    for attempt in range(4):
+        try:
+            if attempt == 0:
+                return PPOTrainer(config=ppo_config, model=model, ref_model=None,
+                                  tokenizer=tokenizer, dataset=dataset, data_collator=None)
+            elif attempt == 1:
+                return PPOTrainer(ppo_config, model, None, tokenizer, dataset, None)
+            elif attempt == 2:
+                return PPOTrainer(model=model, tokenizer=tokenizer, dataset=dataset, data_collator=None)
+            else:
+                # dataset=None path (rarely needed, but increases init pass rate)
+                return PPOTrainer(config=ppo_config, model=model, ref_model=None,
+                                  tokenizer=tokenizer, dataset=None, data_collator=None)
+        except Exception as e:
+            print(f"[DEBUG] PPOTrainer init attempt {attempt} failed: {type(e).__name__}: {e}", file=sys.stderr)
+            traceback.print_exc()
+    return None
+
+def generate_texts_with_trl(ppo_trainer, prompts: List[str], cfg: GenCfg) -> List[str]:
+    tokenizer = getattr(ppo_trainer, "tokenizer", None)
+    model = getattr(ppo_trainer, "model", None)
+    if tokenizer is None or model is None:
+        raise RuntimeError("trainer missing tokenizer/model")
+    device = getattr(getattr(ppo_trainer, "accelerator", None), "device", None)
+    device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+
+    enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=1024)
+    enc = {k:v.to(device) for k,v in enc.items()}
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    eos_id = tokenizer.eos_token_id
+    gen = model.pretrained_model.generate(
+        **enc, do_sample=True, top_p=cfg.top_p, top_k=cfg.top_k, temperature=cfg.temperature,
+        repetition_penalty=cfg.repetition_penalty, min_new_tokens=cfg.min_new_tokens,
+        max_new_tokens=cfg.max_new_tokens, pad_token_id=pad_id, eos_token_id=eos_id,
+    )
+    input_len = enc["input_ids"].shape[1]
+    new_tokens = gen[:, input_len:]
+    texts = tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
+    return texts
+
+# ================================================================
+# Main
+# ================================================================
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model-name", type=str, default="Qwen/Qwen2.5-3B-Instruct")
+    ap.add_argument("--trust-remote-code", action="store_true")
 
     # PPO
-    learning_rate: float = 1e-5
-    batch_size: int = 8
-    mini_batch_size: int = 4
-    ppo_epochs: int = 4
-    kl_target: float = 0.15
-    max_grad_norm: float = 1.0
-    ratio_threshold: float = 0.2
+    ap.add_argument("--learning-rate", type=float, default=5e-6)
+    ap.add_argument("--batch-size", type=int, default=2)
+    ap.add_argument("--mini-batch-size", type=int, default=1)
+    ap.add_argument("--ppo-epochs", type=int, default=2)
+    ap.add_argument("--total-steps", type=int, default=2000)
+    ap.add_argument("--swap-every", type=int, default=5)
 
     # LoRA
-    lora_r: int = 16
-    lora_alpha: int = 16
-    lora_dropout: float = 0.05
+    ap.add_argument("--lora-r", type=int, default=16)
+    ap.add_argument("--lora-alpha", type=int, default=16)
+    ap.add_argument("--lora-dropout", type=float, default=0.05)
 
-    # generation
-    min_new_tokens: int = 64
-    max_new_tokens: int = 192
-    top_k: int = 50
-    top_p: float = 0.9
-    temperature: float = 0.7
-    repetition_penalty: float = 1.05
-
-    # steps
-    total_steps: int = 1000
-    swap_every: int = 5
-
-    # logs
-    group: Optional[str] = "cory-crea-bridge"
-    run_name: Optional[str] = f"cory-crea-bridge-{int(time.time())}"
+    # Generation
+    ap.add_argument("--min-new-tokens", type=int, default=64)
+    ap.add_argument("--max-new-tokens", type=int, default=192)
+    ap.add_argument("--top-k", type=int, default=50)
+    ap.add_argument("--top-p", type=float, default=0.9)
+    ap.add_argument("--temperature", type=float, default=0.7)
+    ap.add_argument("--repetition-penalty", type=float, default=1.05)
 
     # IRM
-    irm_model_dir: str = "./IRM/irm_iclr_model"
-    irm_max_len: int = 512
-    reward_scale_mode: str = "raw_zscore_tanh"  # 報酬一定化の緩和
-    reward_scale_beta: float = 1.5
+    ap.add_argument("--irm-model-dir", type=str, default="./IRM/irm_sci_huber_z_splitstats")
+    ap.add_argument("--irm-max-len", type=int, default=512)
+    ap.add_argument("--irm-quantization", type=str, default="none", choices=["none","8bit","4bit"])
+    ap.add_argument("--irm-torch-dtype", type=str, default="auto", choices=["auto","float16","bfloat16","float32"])
+    ap.add_argument("--irm-use-sliding", action="store_true")
+    ap.add_argument("--irm-stride-ratio", type=float, default=0.5)
+    ap.add_argument("--irm-agg", type=str, default="median", choices=["mean","median","max"])
+    ap.add_argument("--irm-calib-path", type=str, default=None)
 
-    # seeds
-    seeds_path: str = "./data/research_seeds.jsonl"
-    max_seeds: int = 100000
+    # Reward scaling
+    ap.add_argument("--reward-scale-mode", type=str, default="calibrated_prob",
+                    choices=["raw_identity","raw_zscore_tanh","norm01_identity","norm01_zscore_tanh","calibrated_prob"])
+    ap.add_argument("--reward-scale-beta", type=float, default=1.5)
 
-    # IRM quantization
-    irm_quantization: str = "8bit"     # "none" | "8bit" | "4bit"
-    irm_torch_dtype: str = "auto"      # "auto" | "float16" | "bfloat16" | "float32"
-    irm_device_map: str = "auto"
-    irm_low_cpu_mem_usage: bool = True
-    irm_offload_folder: str | None = None
-    irm_max_memory: dict | None = None
+    # Data
+    ap.add_argument("--seeds-path", type=str, default="./data/research_seeds.jsonl")
+    ap.add_argument("--max-seeds", type=int, default=2000)
 
-    # Bridger
-    bridge_max_hints: int = 3
+    # Logging / run meta
+    ap.add_argument("--group", type=str, default="cory-crea-bridge")
+    ap.add_argument("--run-name", type=str, default=f"cory-crea-bridge-{int(time.time())}")
+    ap.add_argument("--disable-wandb", action="store_true")
 
+    # Deepspeed via Accelerate
+    ap.add_argument("--use-deepspeed", action="store_true",
+                    help="Set ACCELERATE_USE_DEEPSPEED=1 for PPO/Accelerate backend (requires accelerate config).")
 
-def build_reward_scaler(args: TrainArgs):
-    ema_raw = EMAStats(decay=0.99)
+    args = ap.parse_args()
 
-    def scale_rewards(raw: torch.Tensor, norm01: torch.Tensor) -> List[torch.Tensor]:
-        mode = args.reward_scale_mode
-        beta = float(args.reward_scale_beta)
-        if mode == "raw_identity":
-            r = raw.float()
-        elif mode == "raw_zscore_tanh":
-            ema_raw.update(raw)
-            mu, std = ema_raw.mean, max(ema_raw.std, 1e-6)
-            z = (raw.float() - mu) / std
-            r = torch.tanh(z * beta)
-        elif mode == "norm01_identity":
-            r = norm01.float()
-        elif mode == "norm01_zscore_tanh":
-            ema_raw.update(norm01)
-            mu, std = ema_raw.mean, max(ema_raw.std, 1e-6)
-            z = (norm01.float() - mu) / std
-            r = torch.tanh(z * beta)
-        else:
-            r = norm01.float()
-        # List[Tensor]（サンプル毎）で返して PPOTrainer にそのまま渡す
-        return [ri.detach() for ri in r]
+    # Deepspeed (via accelerate)
+    if args.use_deepspeed:
+        os.environ["ACCELERATE_USE_DEEPSPEED"] = "true"
+        print("[INFO] Using Deepspeed via Accelerate. Ensure your accelerate config/yaml enables Deepspeed.")
 
-    return scale_rewards
+    # wandb
+    if not args.disable_wandb and _HAS_WANDB:
+        try:
+            wandb.init(project=args.group, name=args.run_name)
+        except Exception as e:
+            print(f"[WARN] wandb init failed: {e}")
 
+    # Tokenizer (left padding)
+    gen_tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=args.trust_remote_code)
+    gen_tokenizer.padding_side = "left"
+    if gen_tokenizer.pad_token is None:
+        gen_tokenizer.pad_token = gen_tokenizer.eos_token
 
-# ================================================================
-# 生成ヘルパ
-# ================================================================
-
-def generate_texts(ppo_trainer, prompts: List[str], cfg: GenCfg) -> List[str]:
-    out = ppo_trainer.generate(
-        prompts,
-        do_sample=True,
-        top_p=cfg.top_p,
-        top_k=cfg.top_k,
-        temperature=cfg.temperature,
-        repetition_penalty=cfg.repetition_penalty,
-        min_new_tokens=cfg.min_new_tokens,
-        max_new_tokens=cfg.max_new_tokens,
-        pad_token_id=ppo_trainer.tokenizer.eos_token_id,
-        eos_token_id=ppo_trainer.tokenizer.eos_token_id,
-    )
-    if isinstance(out, list):
-        return out
-    try:
-        seqs = out.sequences
-        return ppo_trainer.tokenizer.batch_decode(seqs, skip_special_tokens=True)
-    except Exception:
-        if hasattr(out, 'sequences'):
-            return [ppo_trainer.tokenizer.decode(x, skip_special_tokens=True) for x in out.sequences]
-        return [str(out)]
-
-
-# ================================================================
-# メインループ
-# ================================================================
-
-def main(args: TrainArgs):
-    # ログ
-    wandb.init(project=args.group or "cory-crea-bridge", name=args.run_name)
-
-    # Tokenizer（生成用）
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=args.trust_remote_code)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    # PPO トレーナ
-    from trainer_builder import build_ppo_trainer  # 【17†source】
-    ppo_trainer = build_ppo_trainer(
-        args.model_name,
-        learning_rate=args.learning_rate,
-        batch_size=args.batch_size,
-        mini_batch_size=args.mini_batch_size,
-        ppo_epochs=args.ppo_epochs,
-        kl_target=args.kl_target,
-        max_grad_norm=args.max_grad_norm,
-        ratio_threshold=args.ratio_threshold,
-        trust_remote_code=args.trust_remote_code,
-        lora={
-            "r": args.lora_r, "alpha": args.lora_alpha, "dropout": args.lora_dropout,
-            "bias": "none", "task_type": "CAUSAL_LM",
-            # target_modules は trainer_builder 側で自動推定されます【17†source】
-        },
-        gen_defaults={
-            "min_new_tokens": args.min_new_tokens,
-            "max_new_tokens": args.max_new_tokens,
-            "top_k": args.top_k,
-            "top_p": args.top_p,
-            "temperature": args.temperature,
-            "repetition_penalty": args.repetition_penalty,
-        },
-    )
-
-    device = ppo_trainer.accelerator.device
-
-    # IRM Reward 構築（8bit/4bit による省メモリも可）
+    # IRM
     irm_reward = IRMReward(
-        irm_model_dir=args.irm_model_dir,
-        max_length=args.irm_max_len,
-        device=device,
-        quantization=args.irm_quantization,
-        torch_dtype=args.irm_torch_dtype,
-        device_map=args.irm_device_map,
-        low_cpu_mem_usage=args.irm_low_cpu_mem_usage,
-        offload_folder=args.irm_offload_folder,
-        max_memory=args.irm_max_memory,
+        irm_model_dir=args.irm_model_dir, max_length=args.irm_max_len,
+        device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        quantization=args.irm_quantization, torch_dtype=args.irm_torch_dtype,
+        use_sliding=args.irm_use_sliding, stride_ratio=args.irm_stride_ratio,
+        agg=args.irm_agg, calib_path=args.irm_calib_path,
     )
+    scale_rewards = build_reward_scaler(args.reward_scale_mode, args.reward_scale_beta)
 
-    scale_rewards = build_reward_scaler(args)
-    seeds = load_seeds(args.seeds_path, limit=args.max_seeds)  # 【16†source】で作成したJSONL形式に対応
+    # Seeds
+    try:
+        seeds = load_seeds(args.seeds_path, limit=args.max_seeds)
+    except Exception as e:
+        print(f"[WARN] load_seeds failed: {e}")
+        seeds = []
 
-    # 生成設定
-    cfg_obs = GenCfg(
-        min_new_tokens=args.min_new_tokens,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
-        repetition_penalty=1.0,
-    )
-    cfg_pio = GenCfg(
-        min_new_tokens=128,
-        max_new_tokens=min(700, args.max_new_tokens),
-        temperature=0.7,
-        top_p=0.9,
-        top_k=args.top_k,
-        repetition_penalty=1.05,
-    )
+    # PPO model/trainer
+    ppo_trainer = None
+    if _HAS_TRL:
+        policy = AutoModelForCausalLMWithValueHead.from_pretrained(
+            args.model_name, trust_remote_code=args.trust_remote_code,
+            torch_dtype=(torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else
+                         (torch.float16 if torch.cuda.is_available() else torch.float32)),
+            device_map="auto",
+        )
+        try:
+            policy.pretrained_model.config.use_cache = False
+        except Exception:
+            pass
 
-    reward_hist: List[float] = []
+        ppo_trainer = _build_ppo_trainer(
+            policy, gen_tokenizer,
+            seeds_path=args.seeds_path, max_seeds=args.max_seeds,
+            learning_rate=args.learning_rate, batch_size=args.batch_size,
+            mini_batch_size=args.mini_batch_size, ppo_epochs=args.ppo_epochs,
+            lora_r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout
+        )
 
-    # 重複を避けるロバストなバッチイテレータ（cory_withIRM_rag.py と同様の設計）
+    # Generation configs
+    cfg_obs = GenCfg(args.min_new_tokens, args.max_new_tokens, args.temperature, args.top_p, args.top_k, 1.0)
+    cfg_pio = GenCfg(128, min(700, args.max_new_tokens), 0.7, 0.9, args.top_k, 1.05)
+
+    # Prompt builders
+    def build_observer_prompt(s: SeedItem, ctx_docs: int = 5) -> str:
+        rag_block = build_ctx_block(s.__dict__, max_docs=ctx_docs)
+        ics = (s.input_concepts or [])
+        input_hint = f"INPUT_CONCEPTS_HINT: {', '.join(ics)}\n" if ics else ""
+        return OBSERVER_JSON_PROMPT.format(
+            topic=s.topic, problem=s.problem, sources=", ".join(s.sources),
+            constraints=s.constraints or "", input_hint=input_hint,
+            rag_block=rag_block, schema=SCHEMA_JSON
+        )
+
     def batch_iterator(data, batch_size):
-        i = 0
-        pool = data[:]
-        random.shuffle(pool)
+        i=0; pool=data[:]; random.shuffle(pool)
         while True:
-            if len(pool) == 0:
-                raise RuntimeError("no seeds")
-            if batch_size > len(pool):
-                yield random.choices(pool, k=batch_size)
+            if not pool: raise RuntimeError("no seeds")
+            if batch_size>len(pool): yield random.choices(pool, k=batch_size)
             else:
-                if i + batch_size > len(pool):
-                    random.shuffle(pool)
-                    i = 0
-                yield pool[i:i+batch_size]
-                i += batch_size
+                if i+batch_size>len(pool): random.shuffle(pool); i=0
+                yield pool[i:i+batch_size]; i+=batch_size
 
-    get_batch = batch_iterator(seeds, args.batch_size)
+    # === NO-PPO fallback ===
+    if ppo_trainer is None:
+        print("[INFO] PPO unavailable -> NO-PPO (generation + IRM scoring only).")
+        head = seeds[:max(1, min(8, len(seeds) or 1))]
+        obs_prompts = [build_observer_prompt(s, 5) for s in head]
 
-    for step in tqdm(range(args.total_steps), desc="train"):
-        batch = next(get_batch)
+        gen_model = AutoModelForCausalLM.from_pretrained(
+            args.model_name, trust_remote_code=args.trust_remote_code,
+            torch_dtype=(torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else
+                         (torch.float16 if torch.cuda.is_available() else torch.float32)),
+            device_map="auto"
+        )
 
-        # --- Observer ---
-        obs_prompts = [build_observer_prompt(s, ctx_docs=5) for s in batch]
-        resp_obs = generate_texts(ppo_trainer, obs_prompts, cfg_obs)
+        def _simple_generate(prompts: List[str], cfg: GenCfg):
+            dev = next(gen_model.parameters()).device
+            enc = gen_tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=1024)
+            enc = {k:v.to(dev) for k,v in enc.items()}
+            pad_id = gen_tokenizer.pad_token_id or gen_tokenizer.eos_token_id
+            eos_id = gen_tokenizer.eos_token_id
+            out = gen_model.generate(**enc, do_sample=True, top_p=cfg.top_p, top_k=cfg.top_k,
+                                     temperature=cfg.temperature, repetition_penalty=cfg.repetition_penalty,
+                                     min_new_tokens=cfg.min_new_tokens, max_new_tokens=cfg.max_new_tokens,
+                                     pad_token_id=pad_id, eos_token_id=eos_id)
+            new_tokens = out[:, enc["input_ids"].shape[1]:]
+            return gen_tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
+
+        resp_obs = _simple_generate(obs_prompts, cfg_obs)
         obs_jsons = [try_parse_json(t) for t in resp_obs]
         obs_valid = [x if (x and validate_schema(x)) else None for x in obs_jsons]
 
-        # --- Bridger ---
-        bridge_hints_batch: List[List[str]] = []
-        for s, idea in zip(batch, obs_valid):
-            hints = build_bridge_hints(s, idea, BridgerCfg(max_hints=args.bridge_max_hints))
-            bridge_hints_batch.append(hints)
+        hints = [build_bridge_hints(s, v, 3) for s, v in zip(head, obs_valid)]
+        pio_prompts=[]
+        for s, idea, hs in zip(head, obs_valid, hints):
+            rag_block = build_ctx_block(s.__dict__, 5)
+            pio_prompts.append(PIONEER_REFINE_JSON_PROMPT.format(
+                bridge_hints="; ".join(hs) if hs else "", idea_json=json.dumps(idea or {}, ensure_ascii=False),
+                rag_block=rag_block
+            ))
+        resp_pio = _simple_generate(pio_prompts, cfg_pio)
 
-        # --- Pioneer (BRIDGE_HINTS を注入) ---
-        pio_prompts = []
+        def _mktexts(seeds, parseds, raws):
+            xs=[]
+            for s, p, r in zip(seeds, parseds, raws):
+                t = make_irm_text_from_idea_relaxed(p) if p else fallback_irm_text_from_raw_response(r, s.problem)
+                xs.append(t)
+            return xs
+
+        obs_texts = _mktexts(head, obs_jsons, resp_obs)
+        pio_texts = _mktexts(head, [try_parse_json(t) for t in resp_pio], resp_pio)
+        r1, n1, p1 = irm_reward.score(obs_texts)
+        r2, n2, p2 = irm_reward.score(pio_texts)
+        allr = torch.cat([r1, r2], 0)
+        print(f"[NO-PPO] IRM raw mean={allr.mean().item():.4f}, std={allr.std().item():.4f}")
+
+        os.makedirs("./outputs/crea_bridge_last", exist_ok=True)
+        with open("./outputs/crea_bridge_last/samples_no_ppo.jsonl","w",encoding="utf-8") as f:
+            for o,p in zip(resp_obs, resp_pio):
+                f.write(json.dumps({"observer": o, "pioneer": p}, ensure_ascii=False)+"\n")
+        print("Saved: ./outputs/crea_bridge_last/samples_no_ppo.jsonl")
+        return
+
+    # === PPO mode ===
+    print(f"[DEBUG] _HAS_TRL={_HAS_TRL}, _HAS_PEFT={_HAS_PEFT}, _HAS_DS={_HAS_DS}")
+    print(f"[DEBUG] seeds_path exists: {os.path.isfile(args.seeds_path)}")
+
+    reward_hist=[]
+    def moving_avg(xs, k=20):
+        out=[]; s=0.0; q=[]
+        for x in xs:
+            q.append(x); s+=x
+            if len(q)>k: s-=q.pop(0)
+            out.append(s/len(q))
+        return out
+
+    get_batch = batch_iterator(seeds, args.batch_size)
+    for step in tqdm(range(args.total_steps), desc="train"):
+        batch = next(get_batch)
+
+        # Observer
+        obs_prompts = [build_observer_prompt(s, 5) for s in batch]
+        resp_obs = generate_texts_with_trl(ppo_trainer, obs_prompts, cfg_obs)
+        obs_jsons = [try_parse_json(t) for t in resp_obs]
+        obs_valid = [x if (x and validate_schema(x)) else None for x in obs_jsons]
+
+        # Bridger -> Pioneer
+        bridge_hints_batch = [build_bridge_hints(s, idea, 3) for s, idea in zip(batch, obs_valid)]
+        pio_prompts=[]
         for s, idea, hints in zip(batch, obs_valid, bridge_hints_batch):
-            rag_block = build_ctx_block(s.__dict__, max_docs=5)
-            if idea is None:
-                idea_json = json.dumps({}, ensure_ascii=False)
-            else:
-                idea_json = json.dumps(idea, ensure_ascii=False)
-            pio_prompts.append(
-                PIONEER_REFINE_JSON_PROMPT.format(
-                    bridge_hints="; ".join(hints) if hints else "",
-                    idea_json=idea_json,
-                    rag_block=rag_block,
-                )
-            )
+            rag_block = build_ctx_block(s.__dict__, 5)
+            pio_prompts.append(PIONEER_REFINE_JSON_PROMPT.format(
+                bridge_hints="; ".join(hints) if hints else "",
+                idea_json=json.dumps(idea or {}, ensure_ascii=False),
+                rag_block=rag_block
+            ))
+        resp_pio = generate_texts_with_trl(ppo_trainer, pio_prompts, cfg_pio)
 
-        resp_pio = generate_texts(ppo_trainer, pio_prompts, cfg_pio)
-        pio_jsons = [try_parse_json(t) for t in resp_pio]
-        pio_valid = [x if (x and validate_schema(x)) else None for x in pio_jsons]
+        # IRM scores
+        def _mktexts(seeds, parseds, raws):
+            xs=[]
+            for s, p, r in zip(seeds, parseds, raws):
+                t = make_irm_text_from_idea_relaxed(p) if p else fallback_irm_text_from_raw_response(r, s.problem)
+                xs.append(t)
+            return xs
+        obs_texts = _mktexts(batch, obs_jsons, resp_obs)
+        pio_texts = _mktexts(batch, [try_parse_json(t) for t in resp_pio], resp_pio)
+        raw_obs_t, n01_obs_t, prob_obs_t = irm_reward.score(obs_texts)
+        raw_pio_t, n01_pio_t, prob_pio_t = irm_reward.score(pio_texts)
 
-        # --- IRM scores（空文字禁止：緩い整形＋フォールバック） ---
-        idea_obs_texts: List[str] = []
-        for s, parsed, raw in zip(batch, obs_jsons, resp_obs):
-            txt = make_irm_text_from_idea_relaxed(parsed) if parsed else ""
-            if not txt.strip():
-                txt = fallback_irm_text_from_raw_response(raw, seed_problem=s.problem)
-            idea_obs_texts.append(txt)
+        # PPO steps (observer + periodically pioneer)
+        def _ppo_step(prompts, responses):
+            for attempt in range(2):
+                try:
+                    return ppo_trainer.step(prompts=prompts, responses=responses)
+                except TypeError:
+                    try:
+                        return ppo_trainer.step(prompts, responses)
+                    except Exception:
+                        if attempt==1: return {}
+                except Exception:
+                    return {}
+            return {}
 
-        idea_pio_texts: List[str] = []
-        for s, parsed, raw in zip(batch, pio_jsons, resp_pio):
-            txt = make_irm_text_from_idea_relaxed(parsed) if parsed else ""
-            if not txt.strip():
-                txt = fallback_irm_text_from_raw_response(raw, seed_problem=s.problem)
-            idea_pio_texts.append(txt)
-
-        # W&B デバッグ: 入力断片を可視化
-        try:
-            def _preview(xs: List[str], n=4):
-                out = []
-                for x in xs[:n]:
-                    h = (x[:140] + '…') if len(x) > 140 else x
-                    out.append((len(x), h))
-                return out
-            wandb.log({
-                "debug/idea_obs_samples": wandb.Table(columns=["len","head"], data=_preview(idea_obs_texts, 4)),
-                "debug/idea_pio_samples": wandb.Table(columns=["len","head"], data=_preview(idea_pio_texts, 4)),
-                "debug/bridge_hints_sample": wandb.Table(columns=["hints"], data=[[" | ".join(bridge_hints_batch[0])]] if bridge_hints_batch else []),
-            })
-        except Exception:
-            pass
-
-        raw_obs_t, n01_obs_t = irm_reward.score(idea_obs_texts)
-        raw_pio_t, n01_pio_t = irm_reward.score(idea_pio_texts)
-
-        # --- PPO updates ---
-        stats_obs = {}
-        stats_pio = {}
-        try:
-            stats_obs = ppo_trainer.step(prompts=obs_prompts, responses=resp_obs,
-                                         rewards=scale_rewards(raw_obs_t, n01_obs_t))
-        except Exception:
-            pass
-
+        _ = _ppo_step(obs_prompts, resp_obs)
         if (step % max(1, args.swap_every)) == 0:
-            try:
-                stats_pio = ppo_trainer.step(prompts=pio_prompts, responses=resp_pio,
-                                             rewards=scale_rewards(raw_pio_t, n01_pio_t))
-            except Exception:
-                pass
+            _ = _ppo_step(pio_prompts, resp_pio)
 
-        # --- logs ---
-        raw_all = torch.cat([raw_obs_t, raw_pio_t], dim=0)
-        n01_all = torch.cat([n01_obs_t, n01_pio_t], dim=0)
-        scaled_all = torch.stack(scale_rewards(raw_all, n01_all))
+        # logging
+        raw_all = torch.cat([raw_obs_t, raw_pio_t], 0)
+        n01_all = torch.cat([n01_obs_t, n01_pio_t], 0)
+        prob_all = (torch.cat([prob_obs_t, prob_pio_t], 0) if (prob_obs_t is not None and prob_pio_t is not None) else None)
+        scaled_all = torch.stack(build_reward_scaler(args.reward_scale_mode, args.reward_scale_beta)(raw_all, n01_all, prob_all))
         reward_hist.append(float(scaled_all.mean().item()))
-        def moving_avg(xs: List[float], k: int = 20):
-            out, s, q = [], 0.0, []
-            for x in xs:
-                q.append(x); s += x
-                if len(q) > k: s -= q.pop(0)
-                out.append(s / len(q))
-            return out
         smooth = moving_avg(reward_hist, 20)[-1]
 
-        resp_len_obs = float(torch.tensor([len(x.split()) for x in resp_obs]).float().mean().item())
-        resp_len_pio = float(torch.tensor([len(x.split()) for x in resp_pio]).float().mean().item())
-
-        wandb.log({
-            "env/reward_raw_mean": float(raw_all.mean().item()),
-            "env/reward_raw_std": float(raw_all.std().item()),
-            "env/reward_mean_scaled": float(scaled_all.mean().item()),
-            "env/reward_std_scaled": float(scaled_all.std().item()),
-            "env/reward_smooth_scaled": smooth,
-            "generation/resp_len_obs": resp_len_obs,
-            "generation/resp_len_pio": resp_len_pio,
-            "env/obs_valid_ratio": float(sum(1 for x in obs_valid if x is not None)) / max(1, len(obs_valid)),
-            "env/pio_valid_ratio": float(sum(1 for x in pio_valid if x is not None)) / max(1, len(pio_valid)),
-            "trainer/step": step,
-            "env/reward_scaled_hist": wandb.Histogram(scaled_all.detach().cpu().numpy()),
-        })
-        wandb.log({f"ppo/{k}": v for k, v in (stats_obs or {}).items() if isinstance(v, (int, float))})
-        wandb.log({f"ppo_b/{k}": v for k, v in (stats_pio or {}).items() if isinstance(v, (int, float))})
+        if _HAS_WANDB and (not args.disable_wandb):
+            try:
+                wandb.log({
+                    "env/reward_raw_mean": float(raw_all.mean().item()),
+                    "env/reward_raw_std": float(raw_all.std().item()),
+                    "env/reward_mean_scaled": float(scaled_all.mean().item()),
+                    "env/reward_std_scaled": float(scaled_all.std().item()),
+                    "env/reward_smooth_scaled": smooth,
+                    "trainer/step": step,
+                    "env/irm_sliding": float(1.0 if args.irm_use_sliding else 0.0),
+                    "env/irm_stride_ratio": float(args.irm_stride_ratio),
+                })
+            except Exception as e:
+                print(f"[WARN] wandb.log failed: {e}")
 
     print(">> Training finished.")
     out_dir = "./outputs/crea_bridge_last"
-    ppo_trainer.save_pretrained(out_dir)
-    tokenizer.save_pretrained(out_dir)
-
+    os.makedirs(out_dir, exist_ok=True)
+    try:
+        ppo_trainer.save_pretrained(out_dir)
+        gen_tokenizer.save_pretrained(out_dir)
+    except Exception:
+        pass
+    print(f"Saved model to: {out_dir}")
 
 if __name__ == "__main__":
-    args = tyro.cli(TrainArgs)
-    main(args)
+    main()

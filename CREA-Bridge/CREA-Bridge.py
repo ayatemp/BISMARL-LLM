@@ -7,17 +7,16 @@ CREA-Bridge (PPO-only version, robust JSON & reward logging)
 - 毎ステップの報酬（生/EMA/平均）をW&Bへ記録、一定間隔で生出力をTableに保存
 
 実行例:
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 python CREA-Bridge.py \
   --model-name Qwen/Qwen2.5-3B-Instruct \
-  --irm-model-dir ../IRM/irm_sci_huber_z_splitstats \
-  --irm-calib-path ../IRM/irm_sci_huber_z_splitstats/eval_summary_valid.json \
+  --irm-model-dir ayarnte/Idea_Reward_Model \   # ← ここだけ変更
   --seeds-path CORY_withRAG/data/research_seeds.fixed.jsonl \
   --irm-use-sliding --irm-stride-ratio 0.75 --irm-agg median \
   --total-steps 400 --ppo-epochs 1 --batch-size 1 --mini-batch-size 1 \
   --max-new-tokens 64 --irm-max-len 384 \
   --learning-rate 5e-6 --lora-r 16 --lora-alpha 16 --lora-dropout 0.05 \
-  --log-every-n 20
+  --log-every-n 20 \
+  --irm-device cuda
 """
 
 import os

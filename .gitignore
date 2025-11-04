@@ -31,3 +31,9 @@ Thumbs.db
 *.Python
 *.pth
 *.pt
+
+*.csv
+*.tsv
+
+# Large data
+IRM/data/iclr/*.csv
